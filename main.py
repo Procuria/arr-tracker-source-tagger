@@ -3,22 +3,22 @@
 Arr Source Tagger (Sonarr + Radarr)
 - Reads torrent trackers from qBittorrent
 - Maps tracker domain to a private-tracker tag, otherwise "public"
-- Applies tag to the imported Movie/Series in Radarr/Sonarr
+- Applies tag via Sonarr/Radarr API
 - Re-tags on upgrade (every import event recalculates source tag)
 
 Modes:
 1) "arr-script" (default): invoked by Sonarr/Radarr Custom Script on import
-2) "webhook": run as a small HTTP service (optional; Coolify-friendly)
+2) "webhook": run as a small HTTP service (Coolify-friendly)
 
 Environment variables (common):
   LOG_LEVEL=DEBUG|INFO|WARNING|ERROR   (default: INFO)
   PUBLIC_TAG=public                   (default: public)
   PRIVATE_TRACKERS_FILE=/config/private_trackers.yml (default: ./private_trackers.yml)
   SOURCE_TAG_PREFIXES=pt-,public      (default: pt-,public)
-  STATE_FILE=/data/state.json         (default: ./state.json)  # best-effort; optional
+  STATE_FILE=/data/state.json         (default: ./state.json)
 
 qBittorrent:
-  QBIT_URL=http://qbittorrent:8080
+  QBIT_URL=https://qbittorrent.example/
   QBIT_USERNAME=...
   QBIT_PASSWORD=...
   QBIT_VERIFY_TLS=true|false (default: true)
@@ -34,18 +34,12 @@ Webhook mode:
   RUN_MODE=webhook
   WEBHOOK_BIND=0.0.0.0
   WEBHOOK_PORT=8787
+  WEBHOOK_SECRET=...    # if set, /tag and /health require auth
 
-Arr custom script mode:
-  Sonarr provides (typical):
-    SONARR_EVENTTYPE=Download
-    SONARR_SERIES_ID=123
-    SONARR_DOWNLOAD_ID=<torrent hash>
-    SONARR_ISUPGRADE=True|False
-  Radarr provides (typical):
-    RADARR_EVENTTYPE=Download
-    RADARR_MOVIE_ID=456
-    RADARR_DOWNLOAD_ID=<torrent hash>
-    RADARR_ISUPGRADE=True|False
+Webhook Secret accepted via:
+  - Header: X-Webhook-Secret: <secret>
+  - Header: Authorization: Bearer <secret>
+  - Query:  ?secret=<secret>
 """
 
 from __future__ import annotations
@@ -61,10 +55,19 @@ from urllib.parse import urlparse
 
 import requests
 
+# Optional .env loading (recommended for local dev)
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv(override=True)
+except Exception:
+    # Not fatal: still works with normal environment variables
+    pass
+
 try:
     import yaml  # type: ignore
 except Exception:
-    yaml = None  # Will handle gracefully
+    yaml = None  # handled gracefully
 
 
 # -----------------------------
@@ -132,7 +135,7 @@ def load_private_tracker_map(path: str) -> Dict[str, str]:
     if yaml is None:
         die(
             "PyYAML is not installed but a YAML mapping file is used. "
-            "Install dependencies from requirements.txt or set PRIVATE_TRACKERS_FILE to a JSON file.",
+            "Install dependencies or switch mapping file to JSON.",
             2,
         )
 
@@ -140,7 +143,6 @@ def load_private_tracker_map(path: str) -> Dict[str, str]:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         m = data.get("private_trackers", {}) or {}
-        # Normalize keys to lowercase
         out: Dict[str, str] = {}
         for k, v in m.items():
             if not k or not v:
@@ -163,13 +165,16 @@ def parse_domain(url: str) -> Optional[str]:
 def summarize_domains(domains: List[str]) -> str:
     if not domains:
         return "(none)"
-    # Show up to 6 domains, then summarize
     shown = domains[:6]
     rest = len(domains) - len(shown)
     if rest > 0:
         return ", ".join(shown) + f" (+{rest} more)"
     return ", ".join(shown)
 
+
+# -----------------------------
+# Webhook Secret helpers
+# -----------------------------
 def mask(s: str, keep: int = 4) -> str:
     if not s:
         return ""
@@ -179,19 +184,17 @@ def mask(s: str, keep: int = 4) -> str:
 
 
 def webhook_secret_ok(req) -> bool:
-    expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
-    if not expected:
-        return True
     """
     Accept secret via:
-      - X-Webhook-Secret header
+      - X-Webhook-Secret header (and common variants)
       - Authorization: Bearer <secret>
       - query param ?secret=<secret>
     If WEBHOOK_SECRET is unset/empty => allow.
     """
-   
+    expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
+    if not expected:
+        return True
 
-    # Common header variants used by Arr / proxies
     header_candidates = [
         "X-Webhook-Secret",
         "X-WebhookSecret",
@@ -203,20 +206,17 @@ def webhook_secret_ok(req) -> bool:
         if got and got == expected:
             return True
 
-    # Authorization: Bearer <secret>
     auth = (req.headers.get("Authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
         if token == expected:
             return True
 
-    # Query param fallback
     q = (req.args.get("secret") or "").strip()
     if q and q == expected:
         return True
 
     return False
-
 
 
 # -----------------------------
@@ -262,10 +262,6 @@ class QbitClient:
         return r.json() if r.text.strip() else []
 
     def resolve_hash(self, download_id: str, fallback_name: Optional[str] = None) -> Optional[str]:
-        """
-        Best case: Arr download_id already is the torrent hash.
-        Fallback: search qBittorrent by name match.
-        """
         if download_id and is_torrent_hash(download_id):
             return download_id.lower()
 
@@ -282,7 +278,6 @@ class QbitClient:
             log("WARNING", f"qBittorrent fallback resolve failed: {e}")
             return None
 
-        # Heuristic: exact contains match
         for t in torrents:
             tname = str(t.get("name", "")).strip().lower()
             thash = str(t.get("hash", "")).strip().lower()
@@ -324,9 +319,6 @@ class ArrClient:
         return r.json() if r.text.strip() else []
 
     def ensure_tag(self, label: str) -> int:
-        """
-        Ensure a tag exists; return its ID.
-        """
         label_norm = label.strip()
         tags = self.get_tags()
         for t in tags:
@@ -360,15 +352,10 @@ class ArrClient:
             die(f"{self.cfg.name}: PUT {path} failed (HTTP {r.status_code}): {r.text.strip()}", 4)
 
     def apply_source_tag(self, item_id: int, chosen_tag: str, source_prefixes: List[str]) -> None:
-        """
-        Remove previous source tags (pt-* and public by default), then add chosen_tag.
-        Keeps all non-source tags intact.
-        """
         item = self.get_item(item_id)
         title = item.get("title") or item.get("titleSlug") or f"ID:{item_id}"
         existing_tag_ids: List[int] = list(item.get("tags") or [])
 
-        # Resolve labels for existing tag IDs
         tag_objects = self.get_tags()
         id_to_label = {int(t["id"]): str(t.get("label", "")) for t in tag_objects if "id" in t}
 
@@ -378,7 +365,6 @@ class ArrClient:
                 p2 = p.strip().lower()
                 if not p2:
                     continue
-                # exact match prefix or exact match label
                 if p2.endswith("-") and l.startswith(p2):
                     return True
                 if l == p2:
@@ -400,7 +386,6 @@ class ArrClient:
         if chosen_id not in new_ids:
             new_ids.append(chosen_id)
 
-        # Write back
         item["tags"] = new_ids
         self.update_item(item)
 
@@ -476,8 +461,6 @@ def choose_source_tag(
 ) -> Tuple[str, List[str]]:
     trackers = qbit.trackers(torrent_hash)
 
-    # Collect domains, ordered by tier then by appearance
-    # qBittorrent tracker entries contain 'tier' and 'url'
     domains: List[str] = []
     candidates: List[Tuple[int, str]] = []
     for tr in trackers:
@@ -494,7 +477,6 @@ def choose_source_tag(
         if dom not in domains:
             domains.append(dom)
 
-    # Decide private vs public
     for dom in domains:
         if dom.lower() in private_map:
             return private_map[dom.lower()], domains
@@ -510,14 +492,12 @@ def run_arr_script_mode() -> None:
 
     private_map = load_private_tracker_map(mapping_file)
 
-    # Arr event
     ev = detect_arr_event_from_env()
     if ev is None:
         return
 
     log("INFO", f"Arr event received: arr={ev.arr}, item_id={ev.item_id}, is_upgrade={ev.is_upgrade}")
 
-    # qBittorrent
     qcfg = QbitConfig(
         base_url=os.getenv("QBIT_URL", "").strip(),
         username=os.getenv("QBIT_USERNAME", "").strip(),
@@ -530,7 +510,6 @@ def run_arr_script_mode() -> None:
     qbit = QbitClient(qcfg)
     qbit.login()
 
-    # Resolve torrent hash
     torrent_hash = qbit.resolve_hash(ev.download_id, fallback_name=ev.title_hint)
     if not torrent_hash:
         die(
@@ -541,12 +520,10 @@ def run_arr_script_mode() -> None:
 
     log("INFO", f"Resolved torrent hash: {torrent_hash}")
 
-    # Determine tag from trackers
     chosen_tag, domains = choose_source_tag(qbit, torrent_hash, private_map, public_tag)
     log("INFO", f"Tracker domains found: {summarize_domains(domains)}")
     log("INFO", f"Chosen source tag: {chosen_tag}")
 
-    # Optional state (best-effort). Even though we re-tag on upgrade, state helps avoid noise.
     state = load_state(state_file)
     prev = state.get(torrent_hash)
     if prev and prev == chosen_tag:
@@ -554,7 +531,6 @@ def run_arr_script_mode() -> None:
     state[torrent_hash] = chosen_tag
     save_state(state_file, state)
 
-    # Arr config + apply
     if ev.arr == "sonarr":
         url = os.getenv("SONARR_URL", "").strip()
         key = os.getenv("SONARR_API_KEY", "").strip()
@@ -562,7 +538,6 @@ def run_arr_script_mode() -> None:
             die("Missing Sonarr config. Set SONARR_URL and SONARR_API_KEY.", 2)
         arr = ArrClient(ArrConfig(name="sonarr", base_url=url, api_key=key))
         arr.apply_source_tag(ev.item_id, chosen_tag, source_prefixes)
-
     else:
         url = os.getenv("RADARR_URL", "").strip()
         key = os.getenv("RADARR_API_KEY", "").strip()
@@ -575,27 +550,9 @@ def run_arr_script_mode() -> None:
 
 
 # -----------------------------
-# Optional Webhook mode (Coolify friendly)
+# Webhook mode (Coolify friendly)
 # -----------------------------
 def run_webhook_mode() -> None:
-    """
-    Lightweight webhook server (optional).
-    This does NOT depend on exact Sonarr/Radarr JSON schema, but expects at least:
-      {
-        "arr": "sonarr"|"radarr",
-        "item_id": 123,
-        "download_id": "<torrent hash>",
-        "is_upgrade": true|false,
-        "title_hint": "optional"
-      }
-
-    Configure Arr to send a Webhook that you can transform upstream (or via a small middleware),
-    OR call this endpoint from your own automation.
-
-    Endpoints:
-      POST /tag
-      GET  /health
-    """
     try:
         from flask import Flask, jsonify, request  # type: ignore
     except Exception:
@@ -608,6 +565,10 @@ def run_webhook_mode() -> None:
         log("INFO", f"Webhook auth enabled (WEBHOOK_SECRET set: {mask(configured)})")
     else:
         log("WARNING", "Webhook auth disabled (WEBHOOK_SECRET not set).")
+
+    @app.get("/")
+    def root():
+        return "ok", 200
 
     @app.get("/health")
     def health():
@@ -625,57 +586,65 @@ def run_webhook_mode() -> None:
         keys = list(payload.keys())
         log("INFO", f"Webhook payload received: keys={keys}")
 
-        # 1) Determine arr type
+        # Determine arr (explicit field OR infer by payload shape)
         arr = str(payload.get("arr", "")).strip().lower()
         if not arr:
-            # infer from schema
             if "movie" in payload or "remoteMovie" in payload:
                 arr = "radarr"
             elif "series" in payload or "episodes" in payload:
                 arr = "sonarr"
 
-        # 2) Handle test events from Arr Connect
         event_type = str(payload.get("eventType", "")).strip().lower()
+        log("INFO", f"Webhook eventType={event_type or '(none)'}, inferred_arr={arr or '(none)'}")
+
+        # Handle Arr Connect Test messages
         if event_type == "test":
-            # must return 200 so Arr UI accepts the webhook config
             if arr in ("radarr", "sonarr"):
                 log("INFO", f"{arr}: Test webhook received. Authentication OK.")
                 return jsonify({"status": "ok", "mode": "test", "arr": arr}), 200
-
-            # Some connectors send minimal test payloads; still accept if auth was OK.
             log("INFO", "Webhook test received (arr could not be inferred). Authentication OK.")
             return jsonify({"status": "ok", "mode": "test", "arr": "unknown"}), 200
 
-        # 3) Non-test events must know arr
+        # Non-test must know arr
         if arr not in ("sonarr", "radarr"):
             return jsonify({"error": "arr must be 'sonarr' or 'radarr'"}), 400
 
-        # 4) Extract item_id + download hash
-        # Your own generic payloads (what you used in curl tests)
+        # Extract fields (generic payload + Arr-native payload)
         item_id = payload.get("item_id")
         download_id = str(payload.get("download_id", "")).strip()
         is_upgrade = bool(payload.get("is_upgrade", False))
         title_hint = payload.get("title_hint")
 
-        # Arr-native payloads:
-        # Radarr: payload.movie.id, payload.release.downloadId (sometimes)
-        # Sonarr: payload.series.id, payload.release.downloadId (sometimes)
+        # Arr-native top-level fields (camelCase)
+        if not download_id:
+            download_id = str(payload.get("downloadId") or "").strip()
+        if not is_upgrade and "isUpgrade" in payload:
+            is_upgrade = bool(payload.get("isUpgrade"))
+
+        # Extract fields (Arr-native nested best effort)
         if arr == "radarr":
             if item_id is None:
                 item_id = (payload.get("movie") or {}).get("id")
             if not download_id:
                 download_id = str((payload.get("release") or {}).get("downloadId") or "").strip()
             if not title_hint:
-                title_hint = (payload.get("release") or {}).get("releaseTitle") or (payload.get("movie") or {}).get("title")
+                title_hint = (
+                    (payload.get("release") or {}).get("releaseTitle")
+                    or (payload.get("movieFile") or {}).get("relativePath")
+                    or (payload.get("movie") or {}).get("title")
+                )
         else:
             if item_id is None:
                 item_id = (payload.get("series") or {}).get("id")
             if not download_id:
                 download_id = str((payload.get("release") or {}).get("downloadId") or "").strip()
             if not title_hint:
-                title_hint = (payload.get("release") or {}).get("releaseTitle") or (payload.get("series") or {}).get("title")
+                title_hint = (
+                    (payload.get("release") or {}).get("releaseTitle")
+                    or (payload.get("series") or {}).get("title")
+                )
 
-        # validate
+        # Validate
         if not isinstance(item_id, int):
             return jsonify({"error": "item_id must be an integer"}), 400
         if not download_id:
@@ -708,7 +677,6 @@ def run_webhook_mode() -> None:
         except Exception as e:
             log("ERROR", f"Unhandled exception in webhook mode: {e}")
             return jsonify({"status": "error", "message": str(e)}), 500
-
 
     bind = os.getenv("WEBHOOK_BIND", "0.0.0.0")
     port = int(os.getenv("WEBHOOK_PORT", "8787"))
