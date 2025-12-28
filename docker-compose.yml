@@ -1,7 +1,7 @@
 services:
   arr-source-tagger:
     build: .
-    container_name: arr-source-tagger
+    container_name: arr-tracker-source-tagger
     environment:
       LOG_LEVEL: INFO
       RUN_MODE: webhook               # or "arr-script" if you run it one-shot
