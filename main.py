@@ -186,23 +186,31 @@ def webhook_secret_ok(req) -> bool:
       - query param ?secret=<secret>
     If WEBHOOK_SECRET is unset/empty => allow.
     """
-    expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
-    if not expected:
-        return True
+    def webhook_secret_ok(req) -> bool:
+        expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
+        if not expected:
+            return True
 
-    # 1) Custom header
-    got = (req.headers.get("X-Webhook-Secret") or "").strip()
-    if got and got == expected:
-        return True
+    # Common header variants used by Arr / proxies
+    header_candidates = [
+        "X-Webhook-Secret",
+        "X-WebhookSecret",
+        "X_WEBHOOK_SECRET",
+    ]
 
-    # 2) Authorization Bearer
+    for hn in header_candidates:
+        got = (req.headers.get(hn) or "").strip()
+        if got and got == expected:
+            return True
+
+    # Authorization: Bearer <secret>
     auth = (req.headers.get("Authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
         if token == expected:
             return True
 
-    # 3) Query param fallback (useful for manual curls)
+    # Query param fallback
     q = (req.args.get("secret") or "").strip()
     if q and q == expected:
         return True
@@ -610,25 +618,70 @@ def run_webhook_mode() -> None:
     @app.post("/tag")
     def tag():
         if not webhook_secret_ok(request):
+            log("WARNING", f"Webhook unauthorized. Provided headers: {list(request.headers.keys())}")
             return jsonify({"status": "unauthorized"}), 401
 
         payload = request.get_json(silent=True) or {}
-        log("INFO", f"Webhook payload received: keys={list(payload.keys())}")
+        keys = list(payload.keys())
+        log("INFO", f"Webhook payload received: keys={keys}")
 
+        # 1) Determine arr type
         arr = str(payload.get("arr", "")).strip().lower()
+        if not arr:
+            # infer from schema
+            if "movie" in payload or "remoteMovie" in payload:
+                arr = "radarr"
+            elif "series" in payload or "episodes" in payload:
+                arr = "sonarr"
+
+        # 2) Handle test events from Arr Connect
+        event_type = str(payload.get("eventType", "")).strip().lower()
+        if event_type == "test":
+            # must return 200 so Arr UI accepts the webhook config
+            if arr in ("radarr", "sonarr"):
+                log("INFO", f"{arr}: Test webhook received. Authentication OK.")
+                return jsonify({"status": "ok", "mode": "test", "arr": arr}), 200
+
+            # Some connectors send minimal test payloads; still accept if auth was OK.
+            log("INFO", "Webhook test received (arr could not be inferred). Authentication OK.")
+            return jsonify({"status": "ok", "mode": "test", "arr": "unknown"}), 200
+
+        # 3) Non-test events must know arr
+        if arr not in ("sonarr", "radarr"):
+            return jsonify({"error": "arr must be 'sonarr' or 'radarr'"}), 400
+
+        # 4) Extract item_id + download hash
+        # Your own generic payloads (what you used in curl tests)
         item_id = payload.get("item_id")
         download_id = str(payload.get("download_id", "")).strip()
         is_upgrade = bool(payload.get("is_upgrade", False))
         title_hint = payload.get("title_hint")
 
-        if arr not in ("sonarr", "radarr"):
-            return jsonify({"error": "arr must be 'sonarr' or 'radarr'"}), 400
+        # Arr-native payloads:
+        # Radarr: payload.movie.id, payload.release.downloadId (sometimes)
+        # Sonarr: payload.series.id, payload.release.downloadId (sometimes)
+        if arr == "radarr":
+            if item_id is None:
+                item_id = (payload.get("movie") or {}).get("id")
+            if not download_id:
+                download_id = str((payload.get("release") or {}).get("downloadId") or "").strip()
+            if not title_hint:
+                title_hint = (payload.get("release") or {}).get("releaseTitle") or (payload.get("movie") or {}).get("title")
+        else:
+            if item_id is None:
+                item_id = (payload.get("series") or {}).get("id")
+            if not download_id:
+                download_id = str((payload.get("release") or {}).get("downloadId") or "").strip()
+            if not title_hint:
+                title_hint = (payload.get("release") or {}).get("releaseTitle") or (payload.get("series") or {}).get("title")
+
+        # validate
         if not isinstance(item_id, int):
             return jsonify({"error": "item_id must be an integer"}), 400
         if not download_id:
-            return jsonify({"error": "download_id is required"}), 400
+            return jsonify({"error": "download_id is required for non-test events"}), 400
 
-        # Inject into env-like flow
+        # Inject into env-like flow and run
         os.environ.pop("SONARR_EVENTTYPE", None)
         os.environ.pop("RADARR_EVENTTYPE", None)
 
@@ -649,12 +702,13 @@ def run_webhook_mode() -> None:
 
         try:
             run_arr_script_mode()
-            return jsonify({"status": "ok"}), 200
+            return jsonify({"status": "ok", "arr": arr}), 200
         except SystemExit as e:
             return jsonify({"status": "error", "code": int(e.code)}), 500
         except Exception as e:
             log("ERROR", f"Unhandled exception in webhook mode: {e}")
             return jsonify({"status": "error", "message": str(e)}), 500
+
 
     bind = os.getenv("WEBHOOK_BIND", "0.0.0.0")
     port = int(os.getenv("WEBHOOK_PORT", "8787"))
