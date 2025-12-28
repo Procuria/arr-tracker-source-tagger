@@ -1,0 +1,29 @@
+services:
+  arr-source-tagger:
+    build: .
+    container_name: arr-source-tagger
+    environment:
+      LOG_LEVEL: INFO
+      RUN_MODE: webhook               # or "arr-script" if you run it one-shot
+      WEBHOOK_PORT: "8787"
+      WEBHOOK_BIND: "0.0.0.0"
+
+      PUBLIC_TAG: public
+      PRIVATE_TRACKERS_FILE: /config/private_trackers.yml
+      SOURCE_TAG_PREFIXES: "pt-,public"
+      STATE_FILE: /data/state.json
+
+      QBIT_URL: "http://qbittorrent:8080"
+      QBIT_USERNAME: "youruser"
+      QBIT_PASSWORD: "yourpass"
+      QBIT_VERIFY_TLS: "true"
+
+      SONARR_URL: "http://sonarr:8989"
+      SONARR_API_KEY: "sonarrapikey"
+      RADARR_URL: "http://radarr:7878"
+      RADARR_API_KEY: "radarrapikey"
+
+    volumes:
+      - ./private_trackers.yml:/config/private_trackers.yml:ro
+      - ./data:/data
+    restart: unless-stopped
