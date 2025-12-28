@@ -179,6 +179,9 @@ def mask(s: str, keep: int = 4) -> str:
 
 
 def webhook_secret_ok(req) -> bool:
+    expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
+    if not expected:
+        return True
     """
     Accept secret via:
       - X-Webhook-Secret header
@@ -186,10 +189,7 @@ def webhook_secret_ok(req) -> bool:
       - query param ?secret=<secret>
     If WEBHOOK_SECRET is unset/empty => allow.
     """
-    def webhook_secret_ok(req) -> bool:
-        expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
-        if not expected:
-            return True
+   
 
     # Common header variants used by Arr / proxies
     header_candidates = [
