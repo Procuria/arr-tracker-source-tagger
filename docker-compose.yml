@@ -5,6 +5,7 @@ services:
     environment:
       LOG_LEVEL: INFO
       RUN_MODE: webhook               # or "arr-script" if you run it one-shot
+      WEBHOOK_SECRET: "yourwebhooksecret" # or leave empty for no secret
       WEBHOOK_PORT: "8787"
       WEBHOOK_BIND: "0.0.0.0"
 
