@@ -170,6 +170,46 @@ def summarize_domains(domains: List[str]) -> str:
         return ", ".join(shown) + f" (+{rest} more)"
     return ", ".join(shown)
 
+def mask(s: str, keep: int = 4) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "*" * (len(s) - keep)
+
+
+def webhook_secret_ok(req) -> bool:
+    """
+    Accept secret via:
+      - X-Webhook-Secret header
+      - Authorization: Bearer <secret>
+      - query param ?secret=<secret>
+    If WEBHOOK_SECRET is unset/empty => allow.
+    """
+    expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
+    if not expected:
+        return True
+
+    # 1) Custom header
+    got = (req.headers.get("X-Webhook-Secret") or "").strip()
+    if got and got == expected:
+        return True
+
+    # 2) Authorization Bearer
+    auth = (req.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        if token == expected:
+            return True
+
+    # 3) Query param fallback (useful for manual curls)
+    q = (req.args.get("secret") or "").strip()
+    if q and q == expected:
+        return True
+
+    return False
+
+
 
 # -----------------------------
 # qBittorrent client
@@ -555,12 +595,23 @@ def run_webhook_mode() -> None:
 
     app = Flask(__name__)
 
+    configured = (os.getenv("WEBHOOK_SECRET") or "").strip()
+    if configured:
+        log("INFO", f"Webhook auth enabled (WEBHOOK_SECRET set: {mask(configured)})")
+    else:
+        log("WARNING", "Webhook auth disabled (WEBHOOK_SECRET not set).")
+
     @app.get("/health")
     def health():
+        if not webhook_secret_ok(request):
+            return jsonify({"status": "unauthorized"}), 401
         return jsonify({"status": "ok"})
 
     @app.post("/tag")
     def tag():
+        if not webhook_secret_ok(request):
+            return jsonify({"status": "unauthorized"}), 401
+
         payload = request.get_json(silent=True) or {}
         log("INFO", f"Webhook payload received: keys={list(payload.keys())}")
 

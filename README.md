@@ -150,6 +150,29 @@ Sonarr / Radarr API (apply tag)
 
 ## 🛠 Configuration
 
+### 🔐 Webhook Authentication (WEBHOOK_SECRET)
+
+Webhook mode can be protected with a shared secret.
+
+### Configure
+
+Set the secret via environment variable:
+
+```env
+RUN_MODE=webhook
+WEBHOOK_SECRET=change-me-please
+```
+
+If set, `/tag` and `/health` require the secret
+
+Supports either:
+
+- Header: X-Webhook-Secret: <secret>
+- Header: Authorization: Bearer <secret>
+- Query param: ?secret=<secret> (handy for quick manual tests)  
+
+> If WEBHOOK_SECRET is not set, behavior stays as-is (no auth).
+
 ### `.env` (example)
 
 ```env
@@ -157,6 +180,7 @@ LOG_LEVEL=DEBUG
 
 # Mode
 RUN_MODE=webhook
+WEBHOOK_SECRET=change-me-please #or leave empty for no secret 
 
 # qBittorrent
 QBIT_URL=https://qbittorrent.example.org
