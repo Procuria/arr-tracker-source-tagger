@@ -1,10 +1,10 @@
 private_trackers:
-  darkpeers.org: pt-dp
-  fearnopeer.com: pt-fnp
-  hd-space.pw: pt-hds
-  homiehelpdesk.net: pt-hhd
-  seedpool.org: pt-sp
-  tlzdigital.com: pt-tlz
+  darkpeers.org: pt-darkpeers
+  fearnopeer.com: pt-fearnopeer
+  hd-space.pw: pt-hdspace
+  homiehelpdesk.net: pt-homiehelpdesk
+  seedpool.org: pt-seedpool
+  tlzdigital.com: pt-theleechzone
   yoinked.org: pt-yoinked
   tracker.digitalcore.club: pt-digitalcore
   trackerprxy.digitalcore.club: pt-digitalcore
