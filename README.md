@@ -287,7 +287,7 @@ Use **Connect → Custom Script → On Import**
 
 ---
 
-## History backfill (tag existing library using Arr history)
+## 🧾 History backfill (tag existing library using Arr history)
 
 If you deployed this tool after you already had content in Sonarr/Radarr, you can tag your existing library using Arr’s History.
 
