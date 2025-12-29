@@ -858,8 +858,14 @@ def backfill_history_radarr(
             no_grab += 1
             # Optional fallback: if we still have qbit and downloadId looks like hash, try qbit trackers
             if qbit is not None and is_torrent_hash(did):
-                chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
-                reason = f"qbit-fallback:{summarize_domains(domains)}"
+               try:
+                  chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
+                  reason = f"qbit-fallback:{summarize_domains(domains)}"
+               except SystemExit:
+                 # Never abort history backfill due to qBittorrent issues (404/timeouts/etc.)
+                 chosen_tag = public_tag
+                 reason = "qbit-fallback:unavailable"
+
 
         log("INFO", f"radarr history backfill: '{title}' -> tag={chosen_tag} ({reason})")
 
@@ -971,8 +977,13 @@ def backfill_history_sonarr(
         else:
             no_grab += 1
             if qbit is not None and is_torrent_hash(did):
-                chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
-                reason = f"qbit-fallback:{summarize_domains(domains)}"
+               try:
+                  chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
+                  reason = f"qbit-fallback:{summarize_domains(domains)}"
+               except SystemExit:
+                 # Never abort history backfill due to qBittorrent issues (404/timeouts/etc.)
+                 chosen_tag = public_tag
+                 reason = "qbit-fallback:unavailable"
 
         log("INFO", f"sonarr history backfill: '{title}' -> tag={chosen_tag} ({reason})")
 

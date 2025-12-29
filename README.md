@@ -163,7 +163,7 @@ RUN_MODE=webhook
 WEBHOOK_SECRET=change-me-please
 ```
 
-If set, `/tag` and `/health` require the secret
+If set, `/tag`, `/health` and `/backfill/history` require the secret
 
 Supports either:
 
@@ -202,6 +202,11 @@ STATE_FILE=./data/state.json
 
 WEBHOOK_BIND=0.0.0.0
 WEBHOOK_PORT=8787
+
+# History backfill
+# If true, and a grabbed record is missing, the service will try qBittorrent trackers lookup
+# (safe: 404/timeouts won't abort)
+HISTORY_FALLBACK_QBIT=true
 ```
 
 ---
@@ -279,6 +284,79 @@ Use **Connect → Custom Script → On Import**
 - This ensures tagging happens exactly once per import
 - Upgrades automatically trigger re-tagging
 - No polling, no cron jobs
+
+---
+
+## History backfill (tag existing library using Arr history)
+
+If you deployed this tool after you already had content in Sonarr/Radarr, you can tag your existing library using Arr’s History.
+
+This mode uses:
+
+- `grabbed` events to get the indexer (and sometimes source URLs)
+- successful `*Imported*` events to ensure we only tag items that actually imported
+- a join on `downloadId`
+
+### Endpoint
+
+`POST /backfill/history`
+
+Requires the same webhook authentication as `/tag` (see `WEBHOOK_SECRET`).
+
+### Request payload fields
+
+- `arr` *(required)*: `"radarr" | "sonarr" | "both"`
+- `dry_run` *(optional, default: true)*  
+  If `true`, the service will only log what it would do and return a summary — **no tags are changed**.
+- `limit` *(optional, default: 0)*  
+  Max number of items to process. `0` means “no limit”.
+- `only_missing` *(optional, default: true)*  
+  If `true`, only items that **do not already have a source tag** (e.g. `pt-*` or `public`) are processed.
+- `reapply` *(optional, default: false)*  
+  If `true`, re-tag items even if they already have source tags (useful if you changed mappings).
+- `page_size` *(optional, default: 1000)*  
+  How many history records to request from Arr in a single call. Increase if your history is large and you need older entries.
+
+### Tag decision rules (in order)
+
+1. Prefer `private_indexers` mapping from `PRIVATE_TRACKERS_FILE` (matches the normalized grabbed `data.indexer` value)
+2. Fallback: extract domains from grabbed URLs (`nzbInfoUrl`, `guid`, `downloadUrl`) and match against `private_trackers`
+3. If no grabbed record is found for the `downloadId`, optionally try qBittorrent trackers lookup (controlled by `HISTORY_FALLBACK_QBIT`)
+4. Otherwise fallback to `PUBLIC_TAG`
+
+### Sonarr “less noise” behavior
+
+Sonarr tags are applied at **Series** level. The backfill uses the **latest successful import per series** to decide the series’ source tag.
+
+### Example: dry-run both
+
+```bash
+curl -X POST http://localhost:8787/backfill/history \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: YOURSECRET" \
+  -d '{
+    "arr": "both",
+    "dry_run": true,
+    "only_missing": true,
+    "limit": 200,
+    "page_size": 1000
+  }'
+```
+
+### Example: apply changes (Radarr only)
+
+```bash
+curl -X POST http://localhost:8787/backfill/history \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: YOURSECRET" \
+  -d '{
+    "arr": "radarr",
+    "dry_run": false,
+    "only_missing": false,
+    "reapply": true,
+    "page_size": 2000
+  }'
+```
 
 ---
 
