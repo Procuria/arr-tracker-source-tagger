@@ -323,9 +323,18 @@ class QbitClient:
         url = self.cfg.base_url.rstrip("/") + "/api/v2/torrents/trackers"
         log("DEBUG", f"qBittorrent trackers: GET {url}?hash={torrent_hash}")
         r = self.sess.get(url, params={"hash": torrent_hash}, timeout=20)
+
+        # If torrent is no longer in qBittorrent, trackers endpoint returns 404.
+        # This is expected during history-backfill; treat as "no trackers available".
+        if r.status_code == 404:
+            log("INFO", f"qBittorrent: torrent hash not found (404) for trackers lookup: {torrent_hash} (likely removed).")
+            return []
+
         if r.status_code != 200:
-            die(f"qBittorrent trackers request failed (HTTP {r.status_code}): {r.text.strip()}", 3)
+           die(f"qBittorrent trackers request failed (HTTP {r.status_code}): {r.text.strip()}", 3)
+
         return r.json() if r.text.strip() else []
+
 
     def torrents_info(self) -> List[dict]:
         url = self.cfg.base_url.rstrip("/") + "/api/v2/torrents/info"
