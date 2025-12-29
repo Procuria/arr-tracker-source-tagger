@@ -180,3 +180,5 @@ pyrightconfig.json
 private_trackers.yml
 
 data/
+
+test/
