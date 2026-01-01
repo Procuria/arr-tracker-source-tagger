@@ -220,6 +220,12 @@ private_trackers:
   awesome.tracker.org: pt-awesome
   tracker.stellar.club: pt-stellar
   the.one.and.only.com: pt-oao
+
+### for history backfill feature ###
+private_indexers:
+  awesome.tracker.org: pt-awesome
+  tracker.stellar.club: pt-stellar
+  the.one.and.only.com: pt-oao 
 ```
 
 If a torrent contains *any* of these domains, it will be tagged accordingly.
