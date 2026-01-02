@@ -19,6 +19,17 @@ services:
       QBIT_PASSWORD: "yourpass"
       QBIT_VERIFY_TLS: "true"
 
+      # Uploading-tag feature
+      UPLOADING_TAG: uploading
+      UPLOAD_QBIT_CATEGORY: tracker_own_uploads
+
+      # If you have a SECOND qBittorrent just for uploads, set these.
+      # If not set, the tool will fall back to the primary QBIT_* config.
+      QBIT_UPLOAD_URL: 
+      QBIT_UPLOAD_USERNAME: 
+      QBIT_UPLOAD_PASSWORD: 
+      QBIT_UPLOAD_VERIFY_TLS: 
+
       SONARR_URL: "http://sonarr:8989"
       SONARR_API_KEY: "sonarrapikey"
       RADARR_URL: "http://radarr:7878"
