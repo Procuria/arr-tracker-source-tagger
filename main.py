@@ -1121,34 +1121,45 @@ def build_qbit_upload_client() -> QbitClient:
 
 def is_sonarr_full_season(parsed: dict) -> bool:
     """
-    We only tag Sonarr for whole-season releases.
-    The exact parse schema can differ slightly between builds, so we use conservative heuristics:
-      - seasonNumber exists
-      - and episodeNumbers is empty/absent
-      - and/or "episodes" is empty/absent
-      - and/or "releaseType" indicates full season (if present)
+    Determine if Sonarr /api/v3/parse result represents a whole-season pack.
+
+    Sonarr versions differ: some include a populated top-level "episodes" list even for season packs.
+    The most reliable signals are in parsedEpisodeInfo:
+      - fullSeason == true
+      - releaseType == "seasonPack"
+      - seasonNumber present
+      - episodeNumbers empty (common for packs)
     """
     if not isinstance(parsed, dict):
         return False
 
+    pei = parsed.get("parsedEpisodeInfo")
+    if isinstance(pei, dict):
+        # Strong signals first
+        if pei.get("fullSeason") is True:
+            return True
+
+        rt = str(pei.get("releaseType") or "").strip().lower()
+        if rt == "seasonpack":
+            return True
+
+        # Conservative fallback
+        season = pei.get("seasonNumber")
+        if season is None:
+            return False
+
+        eps = pei.get("episodeNumbers")
+        if isinstance(eps, list) and len(eps) == 0:
+            # Many season packs have empty episodeNumbers
+            return True
+
+    # If parsedEpisodeInfo is missing, fall back to older heuristics
     season = parsed.get("seasonNumber")
     if season is None:
         return False
-
-    # Some parsers return 0 for specials; we still consider it a season, but you can restrict if you want.
     eps = parsed.get("episodeNumbers")
     if isinstance(eps, list) and len(eps) > 0:
         return False
-
-    episodes = parsed.get("episodes")
-    if isinstance(episodes, list) and len(episodes) > 0:
-        return False
-
-    rt = str(parsed.get("releaseType") or "").strip().lower()
-    if rt:
-        # If it explicitly says single/episode, reject
-        if "episode" in rt and "season" not in rt:
-            return False
 
     return True
 
@@ -1217,6 +1228,16 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
         # Sonarr match (full season only)
         if sonarr is not None:
             p = sonarr.parse_title(name)
+            pei = p.get("parsedEpisodeInfo") if isinstance(p, dict) else None
+            if isinstance(pei, dict):
+                log(
+                    "DEBUG",
+                    "uploading backfill: sonarr parsedEpisodeInfo="
+                    f"fullSeason={pei.get('fullSeason')}, "
+                    f"releaseType={pei.get('releaseType')}, "
+                    f"seasonNumber={pei.get('seasonNumber')}, "
+                    f"episodeNumbers={pei.get('episodeNumbers')}",
+                )
             if p and isinstance(p.get("series"), dict) and isinstance(p["series"].get("id"), int):
                 sid = int(p["series"]["id"])
                 if is_sonarr_full_season(p):
