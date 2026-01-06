@@ -34,7 +34,7 @@ Webhook mode:
   RUN_MODE=webhook
   WEBHOOK_BIND=0.0.0.0
   WEBHOOK_PORT=8787
-  WEBHOOK_SECRET=...    # if set, /tag and /health require auth
+  WEBHOOK_SECRET=...    # if set, /tag, /health, and /backfill/* require auth
 
 Webhook Secret accepted via:
   - Header: X-Webhook-Secret: <secret>
@@ -48,6 +48,15 @@ History backfill:
         - "downloadFolderImported" (or other "*Imported*") provides success
         - Join is downloadId
     - Sonarr: tags per SERIES (latest successful import per series) -> less noise
+
+Uploading protection:
+  POST /backfill/uploading
+    - Looks at qBittorrent torrents in category UPLOAD_QBIT_CATEGORY (default: tracker_own_uploads)
+    - Matches titles via Arr /api/v3/parse?title=
+    - Applies UPLOADING_TAG (default: uploading)
+    - Sonarr: tags only full-season releases (no single episodes)
+    - qBittorrent instance can be separate via QBIT_UPLOAD_* env vars,
+      otherwise falls back to primary QBIT_*.
 """
 
 from __future__ import annotations
@@ -60,14 +69,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
 
 # Optional .env loading (recommended for local dev)
 try:
     from dotenv import load_dotenv  # type: ignore
-
     load_dotenv(override=True)
 except Exception:
     pass
@@ -158,7 +166,6 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
     if not s:
         return None
     try:
-        # Handles "2025-12-29T20:48:41Z"
         if s.endswith("Z"):
             return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
         dt = datetime.fromisoformat(s)
@@ -173,9 +180,7 @@ def normalize_indexer_name(name: str) -> str:
     n = (name or "").strip().lower()
     if not n:
         return ""
-    # common suffix from Prowlarr integration
     n = n.replace("(prowlarr)", "").strip()
-    # collapse whitespace
     n = re.sub(r"\s+", " ", n)
     return n
 
@@ -199,7 +204,7 @@ def has_source_tag(labels: List[str], source_prefixes: List[str]) -> bool:
 # -----------------------------
 def load_private_config(path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Expected YAML (backwards compatible):
+    Expected YAML:
       private_trackers:
         fearnopeer.com: pt-fnp
       private_indexers:
@@ -241,7 +246,6 @@ def load_private_config(path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
 
 
 def load_private_tracker_map(path: str) -> Dict[str, str]:
-    # kept for backward compatibility with existing code paths
     trackers, _ = load_private_config(path)
     return trackers
 
@@ -258,13 +262,6 @@ def mask(s: str, keep: int = 4) -> str:
 
 
 def webhook_secret_ok(req) -> bool:
-    """
-    Accept secret via:
-      - X-Webhook-Secret header (and common variants)
-      - Authorization: Bearer <secret>
-      - query param ?secret=<secret>
-    If WEBHOOK_SECRET is unset/empty => allow.
-    """
     expected = (os.getenv("WEBHOOK_SECRET") or "").strip()
     if not expected:
         return True
@@ -324,22 +321,23 @@ class QbitClient:
         log("DEBUG", f"qBittorrent trackers: GET {url}?hash={torrent_hash}")
         r = self.sess.get(url, params={"hash": torrent_hash}, timeout=20)
 
-        # If torrent is no longer in qBittorrent, trackers endpoint returns 404.
-        # This is expected during history-backfill; treat as "no trackers available".
+        # Expected during history-backfill when torrents are already removed from qBittorrent
         if r.status_code == 404:
             log("INFO", f"qBittorrent: torrent hash not found (404) for trackers lookup: {torrent_hash} (likely removed).")
             return []
 
         if r.status_code != 200:
-           die(f"qBittorrent trackers request failed (HTTP {r.status_code}): {r.text.strip()}", 3)
+            die(f"qBittorrent trackers request failed (HTTP {r.status_code}): {r.text.strip()}", 3)
 
         return r.json() if r.text.strip() else []
 
-
-    def torrents_info(self) -> List[dict]:
+    def torrents_info(self, category: Optional[str] = None) -> List[dict]:
         url = self.cfg.base_url.rstrip("/") + "/api/v2/torrents/info"
-        log("DEBUG", f"qBittorrent torrents/info: GET {url}")
-        r = self.sess.get(url, timeout=30)
+        params = {}
+        if category:
+            params["category"] = category
+        log("DEBUG", f"qBittorrent torrents/info: GET {url} params={params if params else '{}'}")
+        r = self.sess.get(url, params=params, timeout=30)
         if r.status_code != 200:
             die(f"qBittorrent torrents/info failed (HTTP {r.status_code}): {r.text.strip()}", 3)
         return r.json() if r.text.strip() else []
@@ -478,6 +476,46 @@ class ArrClient:
             f"Removed source tags: {removed if removed else '(none)'}; kept other tags: {len(kept_ids)}.",
         )
 
+    def add_tag(self, item_id: int, label: str) -> bool:
+        """
+        Adds a tag without removing any other tags.
+        Returns True if a change was made.
+        """
+        item = self.get_item(item_id)
+        title = item.get("title") or item.get("titleSlug") or f"ID:{item_id}"
+
+        existing: List[int] = list(item.get("tags") or [])
+        tag_id = self.ensure_tag(label)
+
+        if tag_id in existing:
+            log("DEBUG", f"{self.cfg.name}: Tag '{label}' already present on '{title}'.")
+            return False
+
+        existing.append(tag_id)
+        item["tags"] = existing
+        self.update_item(item)
+        log("INFO", f"{self.cfg.name}: Added tag '{label}' to '{title}'.")
+        return True
+
+    def parse_title(self, title: str) -> Optional[dict]:
+        """
+        Uses Arr parser to identify movie/series and season/episode info from a release title.
+        """
+        t = (title or "").strip()
+        if not t:
+            return None
+        # Many Arr builds support /api/v3/parse?title=...
+        url = self._url("/api/v3/parse") + f"?title={quote(t)}"
+        log("DEBUG", f"{self.cfg.name}: GET {url}")
+        r = self.sess.get(url, timeout=30)
+        if r.status_code != 200:
+            log("DEBUG", f"{self.cfg.name}: parse failed (HTTP {r.status_code}) for title='{t}': {r.text.strip()}")
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+
     def fetch_history(self, page_size: int = 1000) -> List[dict]:
         url = self._url(f"/api/v3/history?page=1&pageSize={page_size}&sortKey=date&sortDirection=descending")
         log("DEBUG", f"{self.cfg.name}: GET {url}")
@@ -485,11 +523,9 @@ class ArrClient:
         if r.status_code != 200:
             die(f"{self.cfg.name}: GET /api/v3/history failed (HTTP {r.status_code}): {r.text.strip()}", 4)
         data = r.json() if r.text.strip() else {}
-        # Arr returns {page, pageSize, records, totalRecords}
         recs = data.get("records")
         if isinstance(recs, list):
             return recs
-        # Some versions may return list directly
         if isinstance(data, list):
             return data
         return []
@@ -508,7 +544,6 @@ class ArrEvent:
 
 
 def detect_arr_event_from_env() -> Optional[ArrEvent]:
-    # Sonarr
     if os.getenv("SONARR_EVENTTYPE"):
         eventtype = (os.getenv("SONARR_EVENTTYPE") or "").strip().lower()
         if eventtype not in ("download", "test"):
@@ -528,7 +563,6 @@ def detect_arr_event_from_env() -> Optional[ArrEvent]:
             die("SONARR_SERIES_ID is missing or not numeric.", 2)
         return ArrEvent(arr="sonarr", item_id=int(sid), download_id=did, is_upgrade=isup, title_hint=title_hint)
 
-    # Radarr
     if os.getenv("RADARR_EVENTTYPE"):
         eventtype = (os.getenv("RADARR_EVENTTYPE") or "").strip().lower()
         if eventtype not in ("download", "test"):
@@ -656,35 +690,22 @@ def history_event_is_grabbed(evt: dict) -> bool:
 
 
 def history_event_is_success_import(evt: dict) -> bool:
-    # Works for both Radarr and Sonarr variants:
-    # - downloadFolderImported
-    # - movieFileImported / episodeFileImported
-    # - ...Imported
     et = str(evt.get("eventType") or "").strip().lower()
     return "imported" in et and "failed" not in et
 
 
 def extract_history_indexer_name(evt: dict) -> str:
-    # Your examples show indexer is under evt.data.indexer for grabbed
     data = evt.get("data") or {}
     if isinstance(data, dict):
         idx = data.get("indexer")
         if idx:
             return str(idx)
-    # fallback (some versions use top-level fields)
     if evt.get("indexer"):
         return str(evt.get("indexer"))
     return ""
 
 
 def extract_history_domains(evt: dict) -> List[str]:
-    """
-    Use URLs that often contain the tracker domain:
-      - nzbInfoUrl
-      - guid
-      - downloadUrl
-    We treat them generically as "source URL(s)".
-    """
     out: List[str] = []
     data = evt.get("data") or {}
     if not isinstance(data, dict):
@@ -695,7 +716,6 @@ def extract_history_domains(evt: dict) -> List[str]:
         if not v:
             continue
         s = str(v).strip()
-        # sometimes Sonarr prefixes "PUSH-"
         if s.lower().startswith("push-"):
             s = s[5:]
         dom = parse_domain(s)
@@ -710,10 +730,6 @@ def choose_tag_from_history_grabbed(
     private_indexers: Dict[str, str],
     public_tag: str,
 ) -> Tuple[str, str]:
-    """
-    Returns (tag, reason).
-    Prefer explicit private_indexers mapping; fallback to domain mapping via URLs in grabbed data.
-    """
     idx_raw = extract_history_indexer_name(grabbed_evt)
     idx_norm = normalize_indexer_name(idx_raw)
     if idx_norm and idx_norm in private_indexers:
@@ -724,7 +740,6 @@ def choose_tag_from_history_grabbed(
         if dom in private_trackers:
             return private_trackers[dom], f"private_trackers:{dom}"
 
-    # still public
     if idx_norm:
         return public_tag, f"public:indexer={idx_norm}"
     if domains:
@@ -733,9 +748,6 @@ def choose_tag_from_history_grabbed(
 
 
 def build_grabbed_index(records: List[dict]) -> Dict[str, List[dict]]:
-    """
-    downloadId -> [grabbed events (with date)]
-    """
     out: Dict[str, List[dict]] = {}
     for r in records:
         if not history_event_is_grabbed(r):
@@ -745,7 +757,6 @@ def build_grabbed_index(records: List[dict]) -> Dict[str, List[dict]]:
             continue
         out.setdefault(did, []).append(r)
 
-    # sort each list by date desc
     for did, lst in out.items():
         lst.sort(
             key=lambda e: parse_iso_utc(str(e.get("date") or "")) or datetime(1970, 1, 1, tzinfo=timezone.utc),
@@ -760,7 +771,6 @@ def pick_best_grabbed_for_import(grabbed_list: List[dict], import_dt: Optional[d
     if not import_dt:
         return grabbed_list[0]
 
-    # choose newest grabbed that is <= import date; else newest grabbed overall
     for g in grabbed_list:
         gdt = parse_iso_utc(str(g.get("date") or ""))
         if gdt and gdt <= import_dt:
@@ -784,7 +794,6 @@ def backfill_history_radarr(
     records = radarr.fetch_history(page_size=page_size)
     grabbed_idx = build_grabbed_index(records)
 
-    # Build list of latest successful imports per movieId
     latest_import_by_movie: Dict[int, dict] = {}
     for r in records:
         if not history_event_is_success_import(r):
@@ -810,11 +819,9 @@ def backfill_history_radarr(
     errors = 0
     no_grab = 0
 
-    # cache tag labels map for "only_missing"
     tag_objs = radarr.get_tags()
     id_to_label = {int(t["id"]): str(t.get("label", "")) for t in tag_objs if "id" in t}
 
-    # newest first
     items = list(latest_import_by_movie.items())
     items.sort(
         key=lambda kv: parse_iso_utc(str(kv[1].get("date") or "")) or datetime(1970, 1, 1, tzinfo=timezone.utc),
@@ -826,7 +833,6 @@ def backfill_history_radarr(
             break
         processed += 1
 
-        # skip if already tagged and only_missing
         try:
             movie = radarr.get_item(mid)
         except SystemExit:
@@ -856,16 +862,13 @@ def backfill_history_radarr(
             chosen_tag, reason = choose_tag_from_history_grabbed(grabbed, private_trackers, private_indexers, public_tag)
         else:
             no_grab += 1
-            # Optional fallback: if we still have qbit and downloadId looks like hash, try qbit trackers
             if qbit is not None and is_torrent_hash(did):
-               try:
-                  chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
-                  reason = f"qbit-fallback:{summarize_domains(domains)}"
-               except SystemExit:
-                 # Never abort history backfill due to qBittorrent issues (404/timeouts/etc.)
-                 chosen_tag = public_tag
-                 reason = "qbit-fallback:unavailable"
-
+                try:
+                    chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
+                    reason = f"qbit-fallback:{summarize_domains(domains)}"
+                except SystemExit:
+                    chosen_tag = public_tag
+                    reason = "qbit-fallback:unavailable"
 
         log("INFO", f"radarr history backfill: '{title}' -> tag={chosen_tag} ({reason})")
 
@@ -907,7 +910,6 @@ def backfill_history_sonarr(
     records = sonarr.fetch_history(page_size=page_size)
     grabbed_idx = build_grabbed_index(records)
 
-    # "less noise": latest successful import per SERIES (not per episode)
     latest_import_by_series: Dict[int, dict] = {}
     for r in records:
         if not history_event_is_success_import(r):
@@ -977,13 +979,12 @@ def backfill_history_sonarr(
         else:
             no_grab += 1
             if qbit is not None and is_torrent_hash(did):
-               try:
-                  chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
-                  reason = f"qbit-fallback:{summarize_domains(domains)}"
-               except SystemExit:
-                 # Never abort history backfill due to qBittorrent issues (404/timeouts/etc.)
-                 chosen_tag = public_tag
-                 reason = "qbit-fallback:unavailable"
+                try:
+                    chosen_tag, domains = choose_source_tag(qbit, did.lower(), private_trackers, public_tag)
+                    reason = f"qbit-fallback:{summarize_domains(domains)}"
+                except SystemExit:
+                    chosen_tag = public_tag
+                    reason = "qbit-fallback:unavailable"
 
         log("INFO", f"sonarr history backfill: '{title}' -> tag={chosen_tag} ({reason})")
 
@@ -1023,7 +1024,6 @@ def run_backfill_history(
 
     private_trackers, private_indexers = load_private_config(mapping_file)
 
-    # Optional qBittorrent fallback (only used when grabbed can't be found)
     qbit: Optional[QbitClient] = None
     if env_bool("HISTORY_FALLBACK_QBIT", True):
         qurl = os.getenv("QBIT_URL", "").strip()
@@ -1091,6 +1091,181 @@ def run_backfill_history(
 
 
 # -----------------------------
+# Uploading backfill (protect active uploads)
+# -----------------------------
+def build_qbit_upload_client() -> QbitClient:
+    """
+    Uses QBIT_UPLOAD_* if set, otherwise falls back to primary QBIT_*.
+    """
+    base_url = (os.getenv("QBIT_UPLOAD_URL") or "").strip() or (os.getenv("QBIT_URL") or "").strip()
+    username = (os.getenv("QBIT_UPLOAD_USERNAME") or "").strip() or (os.getenv("QBIT_USERNAME") or "").strip()
+    password = (os.getenv("QBIT_UPLOAD_PASSWORD") or "").strip() or (os.getenv("QBIT_PASSWORD") or "").strip()
+
+    # TLS verify: if upload var is explicitly set, use it, otherwise inherit primary
+    if os.getenv("QBIT_UPLOAD_VERIFY_TLS") is not None:
+        verify_tls = env_bool("QBIT_UPLOAD_VERIFY_TLS", True)
+    else:
+        verify_tls = env_bool("QBIT_VERIFY_TLS", True)
+
+    if not base_url or not username or not password:
+        die(
+            "Missing upload qBittorrent config. "
+            "Set QBIT_UPLOAD_URL/QBIT_UPLOAD_USERNAME/QBIT_UPLOAD_PASSWORD or ensure primary QBIT_* is configured.",
+            2,
+        )
+
+    qc = QbitClient(QbitConfig(base_url=base_url, username=username, password=password, verify_tls=verify_tls))
+    qc.login()
+    return qc
+
+
+def is_sonarr_full_season(parsed: dict) -> bool:
+    """
+    Determine if Sonarr /api/v3/parse result represents a whole-season pack.
+
+    Sonarr versions differ: some include a populated top-level "episodes" list even for season packs.
+    The most reliable signals are in parsedEpisodeInfo:
+      - fullSeason == true
+      - releaseType == "seasonPack"
+      - seasonNumber present
+      - episodeNumbers empty (common for packs)
+    """
+    if not isinstance(parsed, dict):
+        return False
+
+    pei = parsed.get("parsedEpisodeInfo")
+    if isinstance(pei, dict):
+        # Strong signals first
+        if pei.get("fullSeason") is True:
+            return True
+
+        rt = str(pei.get("releaseType") or "").strip().lower()
+        if rt == "seasonpack":
+            return True
+
+        # Conservative fallback
+        season = pei.get("seasonNumber")
+        if season is None:
+            return False
+
+        eps = pei.get("episodeNumbers")
+        if isinstance(eps, list) and len(eps) == 0:
+            # Many season packs have empty episodeNumbers
+            return True
+
+    # If parsedEpisodeInfo is missing, fall back to older heuristics
+    season = parsed.get("seasonNumber")
+    if season is None:
+        return False
+    eps = parsed.get("episodeNumbers")
+    if isinstance(eps, list) and len(eps) > 0:
+        return False
+
+    return True
+
+
+def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
+    uploading_tag = (os.getenv("UPLOADING_TAG") or "uploading").strip() or "uploading"
+    category = (os.getenv("UPLOAD_QBIT_CATEGORY") or "tracker_own_uploads").strip() or "tracker_own_uploads"
+
+    qbit = build_qbit_upload_client()
+    torrents = qbit.torrents_info(category=category)
+
+    log("INFO", f"uploading backfill: found {len(torrents)} torrents in category '{category}'")
+
+    radarr: Optional[ArrClient] = None
+    sonarr: Optional[ArrClient] = None
+
+    if arr_target in ("radarr", "both"):
+        rurl = os.getenv("RADARR_URL", "").strip()
+        rkey = os.getenv("RADARR_API_KEY", "").strip()
+        if rurl and rkey:
+            radarr = ArrClient(ArrConfig(name="radarr", base_url=rurl, api_key=rkey))
+        else:
+            log("WARNING", "uploading backfill: arr includes radarr but RADARR_URL/RADARR_API_KEY not configured.")
+
+    if arr_target in ("sonarr", "both"):
+        surl = os.getenv("SONARR_URL", "").strip()
+        skey = os.getenv("SONARR_API_KEY", "").strip()
+        if surl and skey:
+            sonarr = ArrClient(ArrConfig(name="sonarr", base_url=surl, api_key=skey))
+        else:
+            log("WARNING", "uploading backfill: arr includes sonarr but SONARR_URL/SONARR_API_KEY not configured.")
+
+    processed = 0
+    matched_radarr = 0
+    matched_sonarr = 0
+    tagged_radarr = 0
+    tagged_sonarr = 0
+    skipped = 0
+
+    for t in torrents:
+        if limit and processed >= limit:
+            break
+        processed += 1
+
+        name = str(t.get("name") or "").strip()
+        thash = str(t.get("hash") or "").strip()
+        if not name:
+            skipped += 1
+            continue
+
+        log("DEBUG", f"uploading backfill: torrent='{name}' hash={thash[:8] if thash else '(none)'}")
+
+        # Radarr match
+        if radarr is not None:
+            p = radarr.parse_title(name)
+            if p and isinstance(p.get("movie"), dict) and isinstance(p["movie"].get("id"), int):
+                mid = int(p["movie"]["id"])
+                matched_radarr += 1
+                log("INFO", f"uploading backfill: radarr match movieId={mid} from '{name}'")
+                if not dry_run:
+                    if radarr.add_tag(mid, uploading_tag):
+                        tagged_radarr += 1
+            else:
+                log("DEBUG", f"uploading backfill: radarr parse no match for '{name}'")
+
+        # Sonarr match (full season only)
+        if sonarr is not None:
+            p = sonarr.parse_title(name)
+            pei = p.get("parsedEpisodeInfo") if isinstance(p, dict) else None
+            if isinstance(pei, dict):
+                log(
+                    "DEBUG",
+                    "uploading backfill: sonarr parsedEpisodeInfo="
+                    f"fullSeason={pei.get('fullSeason')}, "
+                    f"releaseType={pei.get('releaseType')}, "
+                    f"seasonNumber={pei.get('seasonNumber')}, "
+                    f"episodeNumbers={pei.get('episodeNumbers')}",
+                )
+            if p and isinstance(p.get("series"), dict) and isinstance(p["series"].get("id"), int):
+                sid = int(p["series"]["id"])
+                if is_sonarr_full_season(p):
+                    matched_sonarr += 1
+                    log("INFO", f"uploading backfill: sonarr match seriesId={sid} (full season) from '{name}'")
+                    if not dry_run:
+                        if sonarr.add_tag(sid, uploading_tag):
+                            tagged_sonarr += 1
+                else:
+                    log("DEBUG", f"uploading backfill: sonarr match but not full season, skipping '{name}'")
+            else:
+                log("DEBUG", f"uploading backfill: sonarr parse no match for '{name}'")
+
+    return {
+        "status": "ok",
+        "dry_run": dry_run,
+        "category": category,
+        "uploading_tag": uploading_tag,
+        "processed_torrents": processed,
+        "matched_radarr": matched_radarr,
+        "matched_sonarr_full_season": matched_sonarr,
+        "tagged_radarr": tagged_radarr,
+        "tagged_sonarr": tagged_sonarr,
+        "skipped": skipped,
+    }
+
+
+# -----------------------------
 # Webhook mode (Coolify friendly)
 # -----------------------------
 def run_webhook_mode() -> None:
@@ -1127,7 +1302,6 @@ def run_webhook_mode() -> None:
         keys = list(payload.keys())
         log("INFO", f"Webhook payload received: keys={keys}")
 
-        # Determine arr (explicit field OR infer by payload shape)
         arr = str(payload.get("arr", "")).strip().lower()
         if not arr:
             if "movie" in payload or "remoteMovie" in payload:
@@ -1138,7 +1312,6 @@ def run_webhook_mode() -> None:
         event_type = str(payload.get("eventType", "")).strip().lower()
         log("INFO", f"Webhook eventType={event_type or '(none)'}, inferred_arr={arr or '(none)'}")
 
-        # Handle Arr Connect Test messages
         if event_type == "test":
             if arr in ("radarr", "sonarr"):
                 log("INFO", f"{arr}: Test webhook received. Authentication OK.")
@@ -1146,23 +1319,19 @@ def run_webhook_mode() -> None:
             log("INFO", "Webhook test received (arr could not be inferred). Authentication OK.")
             return jsonify({"status": "ok", "mode": "test", "arr": "unknown"}), 200
 
-        # Non-test must know arr
         if arr not in ("sonarr", "radarr"):
             return jsonify({"error": "arr must be 'sonarr' or 'radarr'"}), 400
 
-        # Extract fields (generic payload + Arr-native payload)
         item_id = payload.get("item_id")
         download_id = str(payload.get("download_id", "")).strip()
         is_upgrade = bool(payload.get("is_upgrade", False))
         title_hint = payload.get("title_hint")
 
-        # Arr-native top-level fields (camelCase)
         if not download_id:
             download_id = str(payload.get("downloadId") or "").strip()
         if not is_upgrade and "isUpgrade" in payload:
             is_upgrade = bool(payload.get("isUpgrade"))
 
-        # Extract fields (Arr-native nested best effort)
         if arr == "radarr":
             if item_id is None:
                 item_id = (payload.get("movie") or {}).get("id")
@@ -1185,13 +1354,11 @@ def run_webhook_mode() -> None:
                     or (payload.get("series") or {}).get("title")
                 )
 
-        # Validate
         if not isinstance(item_id, int):
             return jsonify({"error": "item_id must be an integer"}), 400
         if not download_id:
             return jsonify({"error": "download_id is required for non-test events"}), 400
 
-        # Inject into env-like flow and run
         os.environ.pop("SONARR_EVENTTYPE", None)
         os.environ.pop("RADARR_EVENTTYPE", None)
 
@@ -1233,7 +1400,7 @@ def run_webhook_mode() -> None:
             return jsonify({"error": "arr must be 'radarr', 'sonarr' or 'both'"}), 400
 
         dry_run = bool(payload.get("dry_run", True))
-        limit = int(payload.get("limit", 0) or 0)  # 0 = no limit
+        limit = int(payload.get("limit", 0) or 0)
         only_missing = bool(payload.get("only_missing", True))
         reapply = bool(payload.get("reapply", False))
         page_size = int(payload.get("page_size", 1000) or 1000)
@@ -1252,6 +1419,31 @@ def run_webhook_mode() -> None:
             return jsonify({"status": "error", "code": int(e.code)}), 500
         except Exception as e:
             log("ERROR", f"Unhandled exception in backfill(history): {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.post("/backfill/uploading")
+    def backfill_uploading():
+        if not webhook_secret_ok(request):
+            log("WARNING", f"Webhook unauthorized. Provided headers: {list(request.headers.keys())}")
+            return jsonify({"status": "unauthorized"}), 401
+
+        payload = request.get_json(silent=True) or {}
+        log("INFO", f"Backfill(uploading) payload received: keys={list(payload.keys())}")
+
+        arr = str(payload.get("arr", "both")).strip().lower()
+        if arr not in ("radarr", "sonarr", "both"):
+            return jsonify({"error": "arr must be 'radarr', 'sonarr' or 'both'"}), 400
+
+        dry_run = bool(payload.get("dry_run", True))
+        limit = int(payload.get("limit", 0) or 0)
+
+        try:
+            result = run_backfill_uploading(arr_target=arr, dry_run=dry_run, limit=limit)
+            return jsonify(result), 200
+        except SystemExit as e:
+            return jsonify({"status": "error", "code": int(e.code)}), 500
+        except Exception as e:
+            log("ERROR", f"Unhandled exception in backfill(uploading): {e}")
             return jsonify({"status": "error", "message": str(e)}), 500
 
     bind = os.getenv("WEBHOOK_BIND", "0.0.0.0")
