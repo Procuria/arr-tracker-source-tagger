@@ -404,3 +404,66 @@ No — only tags matching `SOURCE_TAG_PREFIXES` are managed.
 > you can automate *everything else*.
 
 Happy tagging.
+
+## 🚦 Upload-aware tagging (stateful)
+
+This feature allows you to **protect content that is currently being uploaded** to trackers by applying a dedicated tag
+(default: `uploading`) in Sonarr/Radarr.
+
+It is designed to work with Maintainerr or similar cleanup tools to avoid accidental deletion of active uploads.
+
+### How it works
+
+- Reads torrents from a qBittorrent **category** (default: `tracker_own_uploads`)
+- Matches torrents to:
+  - **Radarr movies**, or
+  - **Sonarr full-season packs only**
+- Applies the `uploading` tag while the torrent is present
+- **Removes the tag automatically** once the torrent disappears from that category
+- Uses a **separate state file** to avoid re-processing the same torrents repeatedly
+
+### Endpoint
+
+`POST /backfill/uploading`
+
+### Request payload
+
+- `arr` *(optional, default: both)*  
+  `"radarr" | "sonarr" | "both"`
+- `dry_run` *(optional, default: true)*  
+  If `true`, no tags are changed and **no state is written**
+- `limit` *(optional, default: 0)*  
+  Limit number of torrents processed (`0` = unlimited)
+
+### Example (dry-run)
+
+```bash
+curl -X POST http://localhost:8787/backfill/uploading \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: YOURSECRET" \
+  -d '{
+    "arr": "both",
+    "dry_run": true
+  }'
+```
+
+### State file behavior
+
+- State is stored in `UPLOADING_STATE_FILE`
+- **Dry-run never modifies the state**
+- Only new or changed torrents trigger Arr API calls
+- Torrents removed from the upload category automatically trigger tag removal
+
+### Required `.env` additions
+
+```env
+UPLOADING_TAG=uploading
+UPLOAD_QBIT_CATEGORY=tracker_own_uploads
+UPLOADING_STATE_FILE=./data/uploading_state.json
+UPLOADING_SYNC_REMOVE_TAG=true
+UPLOADING_UNMATCHED_TTL_HOURS=24
+QBIT_UPLOAD_URL=
+QBIT_UPLOAD_USERNAME=
+QBIT_UPLOAD_PASSWORD=
+QBIT_UPLOAD_VERIFY_TLS=true
+```
