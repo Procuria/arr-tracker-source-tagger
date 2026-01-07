@@ -42,7 +42,7 @@ SONARR_API_KEY=xxxx
 ### 3) Define private trackers
 ```yaml
 private_trackers:
-  tracker.org: pt-tracker
+  seedpool.org: pt-sp
 ```
 
 ### 4) Start the service
@@ -83,7 +83,7 @@ That’s it — the rest of the README explains *why* this works and how to run 
   - `public` for everything else
 - 🔁 **Re-tags on upgrades** (source is recalculated every import)
 - 📦 Works with **qBittorrent only** (by design, for reliability)
-- 🐳 **Docker ready**
+- 🐳 **Docker & Coolify ready**
 - 🧪 Fully testable locally via **venv + webhook payloads**
 - 🧠 Human-readable, verbose logging
 
@@ -91,6 +91,7 @@ That’s it — the rest of the README explains *why* this works and how to run 
 
 ## 🧠 Core Concept
 
+- **Prowlarr** is your *control plane* (which trackers exist)
 - **qBittorrent** is the *runtime source of truth*
 - **Tracker domain ≈ indexer identity** (especially for private trackers)
 
@@ -150,29 +151,6 @@ Sonarr / Radarr API (apply tag)
 
 ## 🛠 Configuration
 
-### 🔐 Webhook Authentication (WEBHOOK_SECRET)
-
-Webhook mode can be protected with a shared secret.
-
-### Configure
-
-Set the secret via environment variable:
-
-```env
-RUN_MODE=webhook
-WEBHOOK_SECRET=change-me-please
-```
-
-If set, `/tag`, `/health` and `/backfill/history` require the secret
-
-Supports either:
-
-- Header: X-Webhook-Secret: <secret>
-- Header: Authorization: Bearer <secret>
-- Query param: ?secret=<secret> (handy for quick manual tests)  
-
-> If WEBHOOK_SECRET is not set, behavior stays as-is (no auth).
-
 ### `.env` (example)
 
 ```env
@@ -180,7 +158,6 @@ LOG_LEVEL=DEBUG
 
 # Mode
 RUN_MODE=webhook
-WEBHOOK_SECRET=change-me-please #or leave empty for no secret 
 
 # qBittorrent
 QBIT_URL=https://qbittorrent.example.org
@@ -202,11 +179,6 @@ STATE_FILE=./data/state.json
 
 WEBHOOK_BIND=0.0.0.0
 WEBHOOK_PORT=8787
-
-# History backfill
-# If true, and a grabbed record is missing, the service will try qBittorrent trackers lookup
-# (safe: 404/timeouts won't abort)
-HISTORY_FALLBACK_QBIT=true
 ```
 
 ---
@@ -217,15 +189,9 @@ Only **private trackers** belong here.
 
 ```yaml
 private_trackers:
-  awesome.tracker.org: pt-awesome
-  tracker.stellar.club: pt-stellar
-  the.one.and.only.com: pt-oao
-
-### for history backfill feature ###
-private_indexers:
-  awesome.tracker.org: pt-awesome
-  tracker.stellar.club: pt-stellar
-  the.one.and.only.com: pt-oao 
+  seedpool.org: pt-sp
+  tracker.digitalcore.club: pt-digitalcore
+  fearnopeer.com: pt-fnp
 ```
 
 If a torrent contains *any* of these domains, it will be tagged accordingly.
@@ -293,79 +259,6 @@ Use **Connect → Custom Script → On Import**
 
 ---
 
-## 🧾 History backfill (tag existing library using Arr history)
-
-If you deployed this tool after you already had content in Sonarr/Radarr, you can tag your existing library using Arr’s History.
-
-This mode uses:
-
-- `grabbed` events to get the indexer (and sometimes source URLs)
-- successful `*Imported*` events to ensure we only tag items that actually imported
-- a join on `downloadId`
-
-### Endpoint
-
-`POST /backfill/history`
-
-Requires the same webhook authentication as `/tag` (see `WEBHOOK_SECRET`).
-
-### Request payload fields
-
-- `arr` *(required)*: `"radarr" | "sonarr" | "both"`
-- `dry_run` *(optional, default: true)*  
-  If `true`, the service will only log what it would do and return a summary — **no tags are changed**.
-- `limit` *(optional, default: 0)*  
-  Max number of items to process. `0` means “no limit”.
-- `only_missing` *(optional, default: true)*  
-  If `true`, only items that **do not already have a source tag** (e.g. `pt-*` or `public`) are processed.
-- `reapply` *(optional, default: false)*  
-  If `true`, re-tag items even if they already have source tags (useful if you changed mappings).
-- `page_size` *(optional, default: 1000)*  
-  How many history records to request from Arr in a single call. Increase if your history is large and you need older entries.
-
-### Tag decision rules (in order)
-
-1. Prefer `private_indexers` mapping from `PRIVATE_TRACKERS_FILE` (matches the normalized grabbed `data.indexer` value)
-2. Fallback: extract domains from grabbed URLs (`nzbInfoUrl`, `guid`, `downloadUrl`) and match against `private_trackers`
-3. If no grabbed record is found for the `downloadId`, optionally try qBittorrent trackers lookup (controlled by `HISTORY_FALLBACK_QBIT`)
-4. Otherwise fallback to `PUBLIC_TAG`
-
-### Sonarr “less noise” behavior
-
-Sonarr tags are applied at **Series** level. The backfill uses the **latest successful import per series** to decide the series’ source tag.
-
-### Example: dry-run both
-
-```bash
-curl -X POST http://localhost:8787/backfill/history \
-  -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: YOURSECRET" \
-  -d '{
-    "arr": "both",
-    "dry_run": true,
-    "only_missing": true,
-    "limit": 200,
-    "page_size": 1000
-  }'
-```
-
-### Example: apply changes (Radarr only)
-
-```bash
-curl -X POST http://localhost:8787/backfill/history \
-  -H "Content-Type: application/json" \
-  -H "X-Webhook-Secret: YOURSECRET" \
-  -d '{
-    "arr": "radarr",
-    "dry_run": false,
-    "only_missing": false,
-    "reapply": true,
-    "page_size": 2000
-  }'
-```
-
----
-
 ## 📋 Logging
 
 Example log flow:
@@ -396,6 +289,15 @@ No — only tags matching `SOURCE_TAG_PREFIXES` are managed.
 
 ---
 
+## 🧭 Roadmap (optional ideas)
+
+- History-based auto item_id resolution (webhook mode)
+- Multiple private tracker priority rules
+- Export Prowlarr → private_trackers.yml helper
+- Prometheus metrics
+
+---
+
 ## ❤️ Philosophy
 
 > **Make the implicit explicit.**
@@ -404,6 +306,8 @@ No — only tags matching `SOURCE_TAG_PREFIXES` are managed.
 > you can automate *everything else*.
 
 Happy tagging.
+
+---
 
 ## 🚦 Upload-aware tagging (stateful)
 
