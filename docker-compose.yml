@@ -23,6 +23,15 @@ services:
       UPLOADING_TAG: uploading
       UPLOAD_QBIT_CATEGORY: tracker_own_uploads
 
+      # Separate state file for uploading sync
+      UPLOADING_STATE_FILE: ./data/uploading_state.json
+
+      # Remove tag when torrent leaves upload category
+      UPLOADING_SYNC_REMOVE_TAG: true
+
+      # Cache “unmatched” torrents to avoid repeated /parse calls
+      UPLOADING_UNMATCHED_TTL_HOURS: 24
+      
       # If you have a SECOND qBittorrent just for uploads, set these.
       # If not set, the tool will fall back to the primary QBIT_* config.
       QBIT_UPLOAD_URL: 
