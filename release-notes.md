@@ -1,45 +1,44 @@
-# Release v0.4 — Stateful Upload-aware Tagging
+# Release v0.5 — Regression & Stability Fixes
 
-This release introduces **stateful upload-aware tagging**, significantly reducing API load and enabling safe automation around active uploads.
+This release focuses entirely on **stability, regression fixes, and hardening** of existing features introduced in earlier versions.
 
----
-
-## ✨ New Feature: Stateful Upload-aware Backfill
-
-A new endpoint `/backfill/uploading` keeps Sonarr and Radarr in sync with torrents that are actively being uploaded.
-
-### Key characteristics
-
-- Tags content with `uploading` while torrents exist in a configured qBittorrent category
-- Automatically **removes the tag** once the torrent disappears
-- Uses a **dedicated state file** to avoid re-processing already known torrents
-- Dry-run mode is strictly **side-effect free**
-- Designed to integrate with Maintainerr and similar cleanup tools
+No new functionality is introduced in v0.5.
 
 ---
 
-## 🧠 Design details
+## 🛠 Fixed: ArrClient method regressions
 
-- State is stored separately from source-tagging state
-- Only *new* torrents trigger Arr `/parse` calls
-- Sonarr tagging is restricted to **full season packs**
-- Movies are matched against Radarr, series against Sonarr first
-- Optional unmatched-cache avoids repeated parsing of unsupported releases
+Several runtime errors were caused by methods not being bound correctly to `ArrClient` due to earlier refactors and indentation changes.
+
+The following methods are now **guaranteed to exist at runtime** via explicit monkeypatching:
+
+- `apply_source_tag()`  
+- `fetch_history()`  
+
+This prevents runtime failures such as:
+- `AttributeError: 'ArrClient' object has no attribute 'apply_source_tag'`
+- `AttributeError: 'ArrClient' object has no attribute 'fetch_history'`
 
 ---
 
-## ⚙️ New configuration options
+## 🔁 Backfill reliability improvements
 
-```env
-UPLOADING_TAG=uploading
-UPLOAD_QBIT_CATEGORY=tracker_own_uploads
-UPLOADING_STATE_FILE=./data/uploading_state.json
-UPLOADING_SYNC_REMOVE_TAG=true
-UPLOADING_UNMATCHED_TTL_HOURS=24
-```
+- `/backfill/history` is now robust against missing ArrClient methods
+- History backfill no longer aborts due to internal method resolution issues
+- Webhook-based tagging (`/tag`) and history backfill now share a consistent, hardened ArrClient surface
+
+---
+
+## 🧠 Design note
+
+These fixes intentionally favor **runtime safety over structural refactors** to avoid further regressions.  
+Monkeypatching is used deliberately to ensure backward compatibility and predictable behavior across deployments.
+
+A future release may clean up duplicated or mis-indented legacy methods, but v0.5 prioritizes correctness and stability.
 
 ---
 
 ## 🏷 Version
 
-- **Tag:** v0.4
+- **Tag:** v0.5
+- **Scope:** Regression fixes only
