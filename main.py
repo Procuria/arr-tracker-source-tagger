@@ -527,68 +527,6 @@ def remove_tag(self, item_id: int, label: str) -> bool:
     log("INFO", f"{self.cfg.name}: Removed tag '{label_norm}' from '{title}'.")
     return True
 
-    # def apply_source_tag(self, item_id: int, chosen_tag: str, source_prefixes: List[str]) -> None:
-    #     item = self.get_item(item_id)
-    #     title = item.get("title") or item.get("titleSlug") or f"ID:{item_id}"
-    #     existing_tag_ids: List[int] = list(item.get("tags") or [])
-
-    #     tag_objects = self.get_tags()
-    #     id_to_label = {int(t["id"]): str(t.get("label", "")) for t in tag_objects if "id" in t}
-
-    #     def is_source_label(lbl: str) -> bool:
-    #         l = lbl.strip().lower()
-    #         for p in source_prefixes:
-    #             p2 = p.strip().lower()
-    #             if not p2:
-    #                 continue
-    #             if p2.endswith("-") and l.startswith(p2):
-    #                 return True
-    #             if l == p2:
-    #                 return True
-    #         return False
-
-    #     removed: List[str] = []
-    #     kept_ids: List[int] = []
-    #     for tid in existing_tag_ids:
-    #         lbl = id_to_label.get(int(tid), "")
-    #         if lbl and is_source_label(lbl):
-    #             removed.append(lbl)
-    #         else:
-    #             kept_ids.append(int(tid))
-
-    #     chosen_id = self.ensure_tag(chosen_tag)
-
-    #     new_ids = kept_ids[:]
-    #     if chosen_id not in new_ids:
-    #         new_ids.append(chosen_id)
-
-    #     item["tags"] = new_ids
-    #     self.update_item(item)
-
-    #     log(
-    #         "INFO",
-    #         f"{self.cfg.name}: Applied source tag '{chosen_tag}' to '{title}'. "
-    #         f"Removed source tags: {removed if removed else '(none)'}; kept other tags: {len(kept_ids)}.",
-    #     )
-
-    # def fetch_history(self, page_size: int = 1000) -> List[dict]:
-    #     url = self._url(f"/api/v3/history?page=1&pageSize={page_size}&sortKey=date&sortDirection=descending")
-    #     log("DEBUG", f"{self.cfg.name}: GET {url}")
-    #     r = self.sess.get(url, timeout=120)
-    #     if r.status_code != 200:
-    #         die(f"{self.cfg.name}: GET /api/v3/history failed (HTTP {r.status_code}): {r.text.strip()}", 4)
-    #     data = r.json() if r.text.strip() else {}
-    #     # Arr returns {page, pageSize, records, totalRecords}
-    #     recs = data.get("records")
-    #     if isinstance(recs, list):
-    #         return recs
-    #     # Some versions may return list directly
-    #     if isinstance(data, list):
-    #         return data
-    #     return []
-
-
-
 
 # -----------------------------
 # ArrClient: optional helpers (v0.4)
