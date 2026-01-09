@@ -659,6 +659,56 @@ def _arr_remove_tag(self, item_id: int, label: str) -> bool:
     log("INFO", f"{self.cfg.name}: Removed tag '{label_norm}' from '{title}'.")
     return True
 
+def _arr_apply_source_tag(self, item_id: int, chosen_tag: str, source_prefixes: List[str]) -> None:
+    """
+    Remove existing source tags (pt-* and/or 'public' etc. via source_prefixes) and apply chosen_tag.
+    Keeps all other tags intact.
+    """
+    chosen_tag = (chosen_tag or "").strip()
+    if not chosen_tag:
+        raise ValueError("chosen_tag is empty")
+
+    item = self.get_item(item_id)
+    title = item.get("title") or item.get("titleSlug") or f"ID:{item_id}"
+    existing_tag_ids: List[int] = list(item.get("tags") or [])
+
+    tag_objects = self.get_tags()
+    id_to_label = {int(t["id"]): str(t.get("label", "")) for t in tag_objects if "id" in t}
+
+    def is_source_label(lbl: str) -> bool:
+        l = (lbl or "").strip().lower()
+        for p in source_prefixes:
+            p2 = (p or "").strip().lower()
+            if not p2:
+                continue
+            if p2.endswith("-") and l.startswith(p2):
+                return True
+            if l == p2:
+                return True
+        return False
+
+    removed: List[str] = []
+    kept_ids: List[int] = []
+    for tid in existing_tag_ids:
+        lbl = id_to_label.get(int(tid), "")
+        if lbl and is_source_label(lbl):
+            removed.append(lbl)
+        else:
+            kept_ids.append(int(tid))
+
+    chosen_id = self.ensure_tag(chosen_tag)
+    if chosen_id not in kept_ids:
+        kept_ids.append(chosen_id)
+
+    item["tags"] = kept_ids
+    self.update_item(item)
+
+    log(
+        "INFO",
+        f"{self.cfg.name}: Applied source tag '{chosen_tag}' to '{title}'. "
+        f"Removed source tags: {removed if removed else '(none)'}; kept other tags: {len(kept_ids)}.",
+    )
+
 
 # Monkeypatch only if missing (keeps compatibility with older/newer versions of this file)
 if not hasattr(ArrClient, "parse_title"):
@@ -667,6 +717,9 @@ if not hasattr(ArrClient, "add_tag"):
     ArrClient.add_tag = _arr_add_tag  # type: ignore[attr-defined]
 if not hasattr(ArrClient, "remove_tag"):
     ArrClient.remove_tag = _arr_remove_tag  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "apply_source_tag"):
+    ArrClient.apply_source_tag = _arr_apply_source_tag  # type: ignore[attr-defined]
+    
 
 # -----------------------------
 # Core tagging logic (qBittorrent tracker domains)
