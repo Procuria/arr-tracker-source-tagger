@@ -671,6 +671,50 @@ def _arr_fetch_history(self, page_size: int = 1000) -> List[dict]:
 
     return []
 
+def _arr_get_quality_profiles(self) -> List[dict]:
+    url = self._url("/api/v3/qualityprofile")
+    log("DEBUG", f"{self.cfg.name}: GET {url}")
+    r = self.sess.get(url, timeout=60)
+    if r.status_code != 200:
+        die(f"{self.cfg.name}: GET /api/v3/qualityprofile failed (HTTP {r.status_code}): {r.text.strip()}", 4)
+    data = r.json() if r.text.strip() else []
+    return data if isinstance(data, list) else []
+
+def _arr_find_quality_profile_id_by_name(self, profile_name: str) -> Optional[int]:
+    target = (profile_name or "").strip().lower()
+    if not target:
+        return None
+
+    for p in self.get_quality_profiles():
+        name = str(p.get("name") or "").strip().lower()
+        if name == target:
+            try:
+                return int(p.get("id"))
+            except Exception:
+                return None
+    return None
+
+def _arr_set_quality_profile_id(self, item_id: int, new_profile_id: int) -> bool:
+    """
+    Sets qualityProfileId on a movie/series. Returns True if a change was made.
+    """
+    item = self.get_item(item_id)
+    title = item.get("title") or item.get("titleSlug") or f"ID:{item_id}"
+
+    current = item.get("qualityProfileId")
+    try:
+        current_id = int(current)
+    except Exception:
+        current_id = None
+
+    if current_id == int(new_profile_id):
+        log("DEBUG", f"{self.cfg.name}: qualityProfileId already {new_profile_id} on '{title}'.")
+        return False
+
+    item["qualityProfileId"] = int(new_profile_id)
+    self.update_item(item)
+    log("INFO", f"{self.cfg.name}: Set qualityProfileId={new_profile_id} on '{title}'.")
+    return True
 
 
 # Monkeypatch only if missing (keeps compatibility with older/newer versions of this file)
@@ -684,6 +728,13 @@ if not hasattr(ArrClient, "apply_source_tag"):
     ArrClient.apply_source_tag = _arr_apply_source_tag  # type: ignore[attr-defined]
 if not hasattr(ArrClient, "fetch_history"):
     ArrClient.fetch_history = _arr_fetch_history  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "get_quality_profiles"):
+    ArrClient.get_quality_profiles = _arr_get_quality_profiles  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "find_quality_profile_id_by_name"):
+    ArrClient.find_quality_profile_id_by_name = _arr_find_quality_profile_id_by_name  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "set_quality_profile_id"):
+    ArrClient.set_quality_profile_id = _arr_set_quality_profile_id  # type: ignore[attr-defined]
+    
     
     
 
@@ -1001,6 +1052,12 @@ def backfill_history_radarr(
     skipped = 0
     errors = 0
     no_grab = 0
+    profiles_applied = 0
+    profiles_restored = 0
+    profiles_already_ok = 0
+    profiles_fixed = 0
+    profiles_skipped = 0
+
 
     # cache tag labels map for "only_missing"
     tag_objs = radarr.get_tags()
@@ -1416,6 +1473,24 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
             sonarr = ArrClient(ArrConfig(name="sonarr", base_url=surl, api_key=skey))
         else:
             log("WARNING", "uploading sync: arr includes sonarr but SONARR_URL/SONARR_API_KEY not configured.")
+    
+    cqp_name = (os.getenv("UPLOADING_CQP_NAME") or "No Upgrades").strip()
+    enforce_cqp = env_bool("UPLOADING_CQP_ENFORCE", True)
+    restore_cqp = env_bool("UPLOADING_CQP_RESTORE", True)
+
+    radarr_no_upgrades_id = None
+    sonarr_no_upgrades_id = None
+
+    if enforce_cqp and radarr is not None:
+        radarr_no_upgrades_id = radarr.find_quality_profile_id_by_name(cqp_name)
+        if radarr_no_upgrades_id is None:
+            log("WARNING", f"uploading sync: Radarr CQP '{cqp_name}' not found. Profile switching disabled for Radarr.")
+
+    if enforce_cqp and sonarr is not None:
+        sonarr_no_upgrades_id = sonarr.find_quality_profile_id_by_name(cqp_name)
+        if sonarr_no_upgrades_id is None:
+             log("WARNING", f"uploading sync: Sonarr CQP '{cqp_name}' not found. Profile switching disabled for Sonarr.")
+        
 
     processed = 0
     new_tracked = 0
@@ -1446,13 +1521,14 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
         if not name:
             continue
 
-        if th in tracked and isinstance(tracked.get(th), dict):
-            already_tracked += 1
-            tracked[th]["last_seen"] = now
-            if tracked[th].get("name") != name:
-                tracked[th]["name"] = name
-            continue
-
+        # if th in tracked and isinstance(tracked.get(th), dict):
+        #     already_tracked += 1
+        #     tracked[th]["last_seen"] = now
+        #     if tracked[th].get("name") != name:
+        #         tracked[th]["name"] = name
+        #     continue
+        
+        
         if th in unmatched and isinstance(unmatched.get(th), dict) and unmatched_fresh(unmatched[th]) and unmatched[th].get("name") == name:
             skipped_unmatched += 1
             unmatched[th]["last_seen"] = now
