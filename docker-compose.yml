@@ -38,6 +38,9 @@ services:
       # Enforce Quality Profile when tagging uploading torrents and restore previous profile when tag "uploading" is removed
       UPLOADING_CQP_ENFORCE: true
       UPLOADING_CQP_RESTORE: true
+
+      # Interval in minutes to verify the CQP of "uploading" tagged torrents in Sonarr/Radarr
+      UPLOADING_CQP_VERIFY_INTERVAL_MINUTES: 60
       
       # If you have a SECOND qBittorrent just for uploads, set these.
       # If not set, the tool will fall back to the primary QBIT_* config.

@@ -525,6 +525,28 @@ Custom Quality Profile (e.g. `No Upgrades`) to prevent upgrades or re-downloads.
 The previously active quality profile is stored and restored automatically once
 the upload finishes. This avoids accidental changes while content is being seeded.
 
+### How does CQP enforcement minimize Arr API calls?
+The service follows a **state-first approach with periodic verification**.
+
+For items already tracked as `uploading`, the last known quality profile and
+the timestamp of the last verification are stored in `uploading_state.json`.
+As long as that verification is considered “fresh”, the service **does not**
+query Sonarr/Radarr again.
+
+Only after a configurable interval will the Arr API be queried to:
+- confirm the profile is still correct
+- detect manual or external profile changes (“drift”)
+- re-enforce the configured CQP if necessary
+
+This significantly reduces Arr API traffic while still guaranteeing that
+profile drift is eventually corrected.
+
+The verification interval can be controlled via:
+
+```env
+UPLOADING_CQP_VERIFY_INTERVAL_MINUTES=60
+```
+Lower values detect drift faster, higher values further reduce API calls.
 ### Does this interfere with other tools (Maintainerr, Profilarr, manual edits)?
 No by default.
 The service only acts while the `uploading` tag is present and only on the configured
