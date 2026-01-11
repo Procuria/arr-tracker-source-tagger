@@ -1,39 +1,33 @@
-# v0.6 – Uploading-aware Quality Profile Enforcement
+## 📝 release-notes.md — **v0.6.1**
 
-## Added
+# v0.6.1 – State-first CQP verification & API call reduction
 
-- **Uploading tag ↔ Quality Profile enforcement**
-  - When the `uploading` tag is applied, the service now enforces a configurable
-    Custom Quality Profile (CQP), e.g. `No Upgrades`, on the affected Sonarr/Radarr item.
-  - The previously active quality profile is stored in `uploading_state.json` and
-    automatically restored once the `uploading` tag is removed.
+## Improved
 
-- **Drift correction while uploading**
-  - If an item is already tagged as `uploading` but its quality profile was changed
-    manually or by another tool, the service re-applies the configured CQP to ensure
-    upgrades remain blocked.
+- **State-first Quality Profile enforcement**
+  - Upload-aware CQP handling now prefers local state over immediate Arr API calls.
+  - Already tracked items are assumed to be correct unless a periodic verification is due.
 
-- **State-aware and safe by design**
-  - All profile switches are tracked per torrent hash.
-  - `dry_run=true` remains fully side‑effect free (no tags, no profile changes, no state writes).
+- **Periodic drift detection**
+  - Sonarr/Radarr are queried only after a configurable interval to detect
+    manual changes or automation drift.
+  - Ensures correctness without constant polling.
 
-## Configuration
+- **Automatic state backfill**
+  - Items that were already tagged as `uploading` before this change will
+    automatically receive the required CQP state fields on the next run.
 
-New environment variables:
+## New configuration
 
-- `UPLOADING_CQP_NAME` (default: `No Upgrades`)
-- `UPLOADING_CQP_ENFORCE` (default: `true`)
-- `UPLOADING_CQP_RESTORE` (default: `true`)
-
-If the configured CQP cannot be found in an Arr instance, profile switching is
-disabled for that Arr while tagging continues to function.
+```env
+UPLOADING_CQP_VERIFY_INTERVAL_MINUTES=60
+```
+Controls how often an Arr item is re-verified while uploading.
+Defaults to 60 minutes.
 
 ## Why
 
-This release prevents accidental upgrades, re-downloads, or replacements of media
-that is actively being uploaded to trackers, while cleanly restoring the original
-setup once the upload is finished.
+This release significantly reduces unnecessary Arr API traffic while keeping
+the system robust against profile drift caused by manual edits or other tools.
 
----
-
-Quietly practical. Nothing magical — just fewer surprises.
+Less noise. Fewer calls. Same guarantees. 
