@@ -380,31 +380,6 @@ Applied source tag 'pt-sp' to 'Movie Title'
 Logs are intentionally human-readable and suitable for production use.
 
 ---
-
-## ❓ FAQ
-
-### Why not read Prowlarr indexer names?
-Because that information **does not survive the handoff** to the download client.
-Trackers do.
-
-### Why qBittorrent only?
-Because it exposes stable, queryable tracker metadata via API.
-This is a feature, not a limitation.
-
-### Can this break existing tags?
-No — only tags matching `SOURCE_TAG_PREFIXES` are managed.
-
----
-
-## ❤️ Philosophy
-
-> **Make the implicit explicit.**
->
-> Once you know *where* media comes from,
-> you can automate *everything else*.
-
-Happy tagging.
-
 ## 🚦 Upload-aware tagging (stateful)
 
 This feature allows you to **protect content that is currently being uploaded** to trackers by applying a dedicated tag
@@ -467,3 +442,103 @@ QBIT_UPLOAD_USERNAME=
 QBIT_UPLOAD_PASSWORD=
 QBIT_UPLOAD_VERIFY_TLS=true
 ```
+
+---
+
+## 🔒 Uploading tag ↔ Quality Profile enforcement (CQP)
+
+If you are actively uploading content, you often want to **freeze upgrades/re-downloads** for that item until the upload is finished.
+This feature integrates with an existing **Custom Quality Profile (CQP)** (e.g. created via Profilarr) to enforce a “do not touch” policy
+while the `uploading` tag is present.
+
+### Prerequisites
+
+- You must already have a CQP in **Sonarr and Radarr** named (by default): `No Upgrades`  
+- That profile should be configured to **prevent upgrades** (e.g. *Upgrade Allowed = false*).  
+- Sync the profile to both Arrs (e.g. via Profilarr) so it exists in **both** systems.
+
+### Behavior
+
+While a torrent is considered “uploading” (present in your configured qBittorrent category):
+
+- When `uploading` is added, the service switches the item to the CQP `No Upgrades` and stores the previous profile ID in `uploading_state.json`.
+- If `uploading` is present but the item is on a different profile (drift/manual changes), the service enforces `No Upgrades` again.
+- When `uploading` is removed (torrent left the category), the service restores the previously stored profile ID.
+
+All profile changes are logged and included in the `/backfill/uploading` JSON response.
+
+### New `.env` variables
+
+```env
+# CQP enforcement while uploading
+UPLOADING_CQP_NAME=No Upgrades
+UPLOADING_CQP_ENFORCE=true
+UPLOADING_CQP_RESTORE=true
+```
+
+### Notes
+
+- If the configured CQP cannot be found in an Arr instance, profile switching is disabled for that Arr (tagging still works).
+- `dry_run=true` remains side-effect free (no tags, no profile changes, no state writes).
+
+---
+
+## ❓ FAQ
+
+### Why not read Prowlarr indexer names?
+Because that information **does not survive the handoff** to the download client.
+Trackers do.
+
+### Why qBittorrent only?
+Because it exposes stable, queryable tracker metadata via API.
+This is a feature, not a limitation.
+
+### Can this break existing tags?
+No — only tags matching `SOURCE_TAG_PREFIXES` are managed.
+
+### What is “History backfill”?
+It allows tagging **existing library items retroactively** by inspecting Sonarr/Radarr history.
+The service correlates successful imports with prior `grabbed` events to infer the source
+indexer, even if the torrent no longer exists in the download client.
+
+This is intentionally conservative: only completed imports are considered, and no
+re-downloads or searches are triggered.
+
+### What does “upload-aware tagging (stateful)” mean?
+The service can track torrents in a dedicated qBittorrent category (e.g. `tracker_own_uploads`)
+and tag the corresponding Sonarr/Radarr items while they are actively being uploaded.
+
+State is persisted per torrent hash to avoid repeated parsing and unnecessary Arr API calls.
+When the torrent disappears from the category, the tag is automatically removed.
+
+### Why is state needed for upload-aware tagging?
+Without state, every run would require re-parsing titles and re-checking the entire library.
+State allows the service to:
+- only process new or changed torrents
+- detect when uploads have finished
+- cleanly revert changes made during the upload phase
+
+### What is “Uploading tag ↔ Quality Profile enforcement”?
+While an item carries the `uploading` tag, the service can enforce a specific
+Custom Quality Profile (e.g. `No Upgrades`) to prevent upgrades or re-downloads.
+
+The previously active quality profile is stored and restored automatically once
+the upload finishes. This avoids accidental changes while content is being seeded.
+
+### Does this interfere with other tools (Maintainerr, Profilarr, manual edits)?
+No by default.
+The service only acts while the `uploading` tag is present and only on the configured
+Custom Quality Profile. Once the tag is removed, the original state is restored.
+
+If the required profile does not exist, the feature disables itself gracefully.
+
+---
+
+## ❤️ Philosophy
+
+> **Make the implicit explicit.**
+>
+> Once you know *where* media comes from,
+> you can automate *everything else*.
+
+Happy tagging.
