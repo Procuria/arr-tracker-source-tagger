@@ -1,5 +1,0 @@
-{
-  "key": "ctrl+shift+v",
-  "command": "pyPasteIndent.pasteIndent",
-  "when": "editorLangId == 'python'"
-}
