@@ -671,6 +671,50 @@ def _arr_fetch_history(self, page_size: int = 1000) -> List[dict]:
 
     return []
 
+def _arr_get_quality_profiles(self) -> List[dict]:
+    url = self._url("/api/v3/qualityprofile")
+    log("DEBUG", f"{self.cfg.name}: GET {url}")
+    r = self.sess.get(url, timeout=60)
+    if r.status_code != 200:
+        die(f"{self.cfg.name}: GET /api/v3/qualityprofile failed (HTTP {r.status_code}): {r.text.strip()}", 4)
+    data = r.json() if r.text.strip() else []
+    return data if isinstance(data, list) else []
+
+def _arr_find_quality_profile_id_by_name(self, profile_name: str) -> Optional[int]:
+    target = (profile_name or "").strip().lower()
+    if not target:
+        return None
+
+    for p in self.get_quality_profiles():
+        name = str(p.get("name") or "").strip().lower()
+        if name == target:
+            try:
+                return int(p.get("id"))
+            except Exception:
+                return None
+    return None
+
+def _arr_set_quality_profile_id(self, item_id: int, new_profile_id: int) -> bool:
+    """
+    Sets qualityProfileId on a movie/series. Returns True if a change was made.
+    """
+    item = self.get_item(item_id)
+    title = item.get("title") or item.get("titleSlug") or f"ID:{item_id}"
+
+    current = item.get("qualityProfileId")
+    try:
+        current_id = int(current)
+    except Exception:
+        current_id = None
+
+    if current_id == int(new_profile_id):
+        log("DEBUG", f"{self.cfg.name}: qualityProfileId already {new_profile_id} on '{title}'.")
+        return False
+
+    item["qualityProfileId"] = int(new_profile_id)
+    self.update_item(item)
+    log("INFO", f"{self.cfg.name}: Set qualityProfileId={new_profile_id} on '{title}'.")
+    return True
 
 
 # Monkeypatch only if missing (keeps compatibility with older/newer versions of this file)
@@ -684,6 +728,13 @@ if not hasattr(ArrClient, "apply_source_tag"):
     ArrClient.apply_source_tag = _arr_apply_source_tag  # type: ignore[attr-defined]
 if not hasattr(ArrClient, "fetch_history"):
     ArrClient.fetch_history = _arr_fetch_history  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "get_quality_profiles"):
+    ArrClient.get_quality_profiles = _arr_get_quality_profiles  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "find_quality_profile_id_by_name"):
+    ArrClient.find_quality_profile_id_by_name = _arr_find_quality_profile_id_by_name  # type: ignore[attr-defined]
+if not hasattr(ArrClient, "set_quality_profile_id"):
+    ArrClient.set_quality_profile_id = _arr_set_quality_profile_id  # type: ignore[attr-defined]
+    
     
     
 
@@ -1001,6 +1052,12 @@ def backfill_history_radarr(
     skipped = 0
     errors = 0
     no_grab = 0
+    profiles_applied = 0
+    profiles_restored = 0
+    profiles_already_ok = 0
+    profiles_fixed = 0
+    profiles_skipped = 0
+
 
     # cache tag labels map for "only_missing"
     tag_objs = radarr.get_tags()
@@ -1417,6 +1474,24 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
         else:
             log("WARNING", "uploading sync: arr includes sonarr but SONARR_URL/SONARR_API_KEY not configured.")
 
+    # --- CQP enforcement config ---
+    cqp_name = (os.getenv("UPLOADING_CQP_NAME") or "No Upgrades").strip()
+    enforce_cqp = env_bool("UPLOADING_CQP_ENFORCE", True)
+    restore_cqp = env_bool("UPLOADING_CQP_RESTORE", True)
+
+    radarr_no_upgrades_id = None
+    sonarr_no_upgrades_id = None
+
+    if enforce_cqp and radarr is not None:
+        radarr_no_upgrades_id = radarr.find_quality_profile_id_by_name(cqp_name)
+        if radarr_no_upgrades_id is None:
+            log("WARNING", f"uploading sync: Radarr CQP '{cqp_name}' not found. Profile switching disabled for Radarr.")
+
+    if enforce_cqp and sonarr is not None:
+        sonarr_no_upgrades_id = sonarr.find_quality_profile_id_by_name(cqp_name)
+        if sonarr_no_upgrades_id is None:
+            log("WARNING", f"uploading sync: Sonarr CQP '{cqp_name}' not found. Profile switching disabled for Sonarr.")
+
     processed = 0
     new_tracked = 0
     already_tracked = 0
@@ -1426,6 +1501,13 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
     tagged_sonarr = 0
     removed_tags = 0
     errors = 0
+
+    # --- CQP counters (new feature) ---
+    profiles_applied = 0
+    profiles_fixed = 0
+    profiles_already_ok = 0
+    profiles_restored = 0
+    profiles_restore_skipped = 0
 
     def unmatched_fresh(entry: dict) -> bool:
         try:
@@ -1446,16 +1528,68 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
         if not name:
             continue
 
+        # --- already tracked torrent: update last_seen and enforce profile while uploading (Case 3) ---
         if th in tracked and isinstance(tracked.get(th), dict):
             already_tracked += 1
-            tracked[th]["last_seen"] = now
-            if tracked[th].get("name") != name:
-                tracked[th]["name"] = name
-            continue
+            entry = tracked[th]
 
+            # Update last_seen only when NOT dry-run (state is only persisted when not dry_run)
+            if not dry_run:
+                entry["last_seen"] = now
+
+            # Enforce CQP "No Upgrades" while uploading tag is active (Case 3)
+            if enforce_cqp:
+                arr_name = str(entry.get("arr") or "").strip().lower()
+                arr_id = entry.get("arr_id")
+
+                if isinstance(arr_id, str) and arr_id.isdigit():
+                    arr_id = int(arr_id)
+
+                if isinstance(arr_id, int) and arr_id > 0:
+                    # --- Radarr ---
+                    if arr_name == "radarr" and radarr is not None and radarr_no_upgrades_id is not None:
+                        item = radarr.get_item(arr_id)
+                        current_pid = int(item.get("qualityProfileId") or 0)
+
+                        if current_pid == radarr_no_upgrades_id:
+                            profiles_already_ok += 1
+                        else:
+                            # store previous profile once
+                            if "profile_before" not in entry and current_pid and not dry_run:
+                                entry["profile_before"] = current_pid
+
+                            if not dry_run:
+                                if radarr.set_quality_profile_id(arr_id, radarr_no_upgrades_id):
+                                    profiles_fixed += 1
+
+                            log("INFO", f"uploading sync: enforced CQP '{cqp_name}' for Radarr item_id={arr_id} (was {current_pid}).")
+
+                    # --- Sonarr ---
+                    elif arr_name == "sonarr" and sonarr is not None and sonarr_no_upgrades_id is not None:
+                        item = sonarr.get_item(arr_id)
+                        current_pid = int(item.get("qualityProfileId") or 0)
+
+                        if current_pid == sonarr_no_upgrades_id:
+                            profiles_already_ok += 1
+                        else:
+                            if "profile_before" not in entry and current_pid and not dry_run:
+                                entry["profile_before"] = current_pid
+
+                            if not dry_run:
+                                if sonarr.set_quality_profile_id(arr_id, sonarr_no_upgrades_id):
+                                    profiles_fixed += 1
+
+                            log("INFO", f"uploading sync: enforced CQP '{cqp_name}' for Sonarr item_id={arr_id} (was {current_pid}).")
+
+            continue
+        # --- end already tracked torrent block ---
+
+        # skip fresh unmatched cache
         if th in unmatched and isinstance(unmatched.get(th), dict) and unmatched_fresh(unmatched[th]) and unmatched[th].get("name") == name:
             skipped_unmatched += 1
-            unmatched[th]["last_seen"] = now
+            # Only persist when not dry_run; still OK to update in memory
+            if not dry_run:
+                unmatched[th]["last_seen"] = now
             continue
 
         want_sonarr_first = looks_like_series_title(name) and sonarr is not None
@@ -1463,6 +1597,10 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
 
         matched = False
 
+        # Prepare a state entry for a new match (only persisted when not dry_run)
+        entry = {"name": name, "tag": uploading_tag, "last_seen": now}
+
+        # --- Try Sonarr first ---
         if want_sonarr_first and sonarr is not None:
             parse_calls += 1
             p = sonarr.parse_title(name)
@@ -1470,51 +1608,127 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
                 sid = int(p["series"]["id"])
                 if is_sonarr_full_season(p):
                     log("INFO", f"uploading sync: sonarr match seriesId={sid} (full season) from '{name}'")
+
+                    entry["arr"] = "sonarr"
+                    entry["arr_id"] = sid
+
+                    # Tag
                     if not dry_run:
                         try:
                             if sonarr.add_tag(sid, uploading_tag):
                                 tagged_sonarr += 1
                         except SystemExit:
                             errors += 1
-                    tracked[th] = {"name": name, "arr": "sonarr", "arr_id": sid, "tag": uploading_tag, "last_seen": now}
-                    new_tracked += 1
+
+                    # CQP enforce (Case 1)
+                    if enforce_cqp and sonarr_no_upgrades_id is not None:
+                        item = sonarr.get_item(sid)
+                        current_pid = int(item.get("qualityProfileId") or 0)
+
+                        if current_pid == sonarr_no_upgrades_id:
+                            profiles_already_ok += 1
+                        else:
+                            if current_pid and current_pid != sonarr_no_upgrades_id and not dry_run:
+                                entry["profile_before"] = current_pid
+
+                            if not dry_run and current_pid != sonarr_no_upgrades_id:
+                                if sonarr.set_quality_profile_id(sid, sonarr_no_upgrades_id):
+                                    profiles_applied += 1
+
+                            log("INFO", f"uploading sync: set CQP '{cqp_name}' for Sonarr seriesId={sid} (was {current_pid}).")
+
+                    if not dry_run:
+                        tracked[th] = entry
+                        new_tracked += 1
+
                     matched = True
                 else:
                     log("DEBUG", f"uploading sync: sonarr match but not full season, skipping '{name}'")
-                    unmatched[th] = {"name": name, "reason": "sonarr:not_full_season", "last_seen": now}
+                    if not dry_run:
+                        unmatched[th] = {"name": name, "reason": "sonarr:not_full_season", "last_seen": now}
                     skipped_unmatched += 1
                     matched = True
 
+        # --- Try Radarr first ---
         if (not matched) and want_radarr_first and radarr is not None:
             parse_calls += 1
             p = radarr.parse_title(name)
             if p and isinstance(p.get("movie"), dict) and isinstance(p["movie"].get("id"), int):
                 mid = int(p["movie"]["id"])
                 log("INFO", f"uploading sync: radarr match movieId={mid} from '{name}'")
+
+                entry["arr"] = "radarr"
+                entry["arr_id"] = mid
+
+                # Tag
                 if not dry_run:
                     try:
                         if radarr.add_tag(mid, uploading_tag):
                             tagged_radarr += 1
                     except SystemExit:
                         errors += 1
-                tracked[th] = {"name": name, "arr": "radarr", "arr_id": mid, "tag": uploading_tag, "last_seen": now}
-                new_tracked += 1
+
+                # CQP enforce (Case 1)
+                if enforce_cqp and radarr_no_upgrades_id is not None:
+                    item = radarr.get_item(mid)
+                    current_pid = int(item.get("qualityProfileId") or 0)
+
+                    if current_pid == radarr_no_upgrades_id:
+                        profiles_already_ok += 1
+                    else:
+                        if current_pid and current_pid != radarr_no_upgrades_id and not dry_run:
+                            entry["profile_before"] = current_pid
+
+                        if not dry_run and current_pid != radarr_no_upgrades_id:
+                            if radarr.set_quality_profile_id(mid, radarr_no_upgrades_id):
+                                profiles_applied += 1
+
+                        log("INFO", f"uploading sync: set CQP '{cqp_name}' for Radarr movieId={mid} (was {current_pid}).")
+
+                if not dry_run:
+                    tracked[th] = entry
+                    new_tracked += 1
+
                 matched = True
 
+        # --- Fallback try both if unclear ---
         if not matched and radarr is not None and sonarr is not None:
             parse_calls += 1
             pr = radarr.parse_title(name)
             if pr and isinstance(pr.get("movie"), dict) and isinstance(pr["movie"].get("id"), int):
                 mid = int(pr["movie"]["id"])
                 log("INFO", f"uploading sync: radarr match movieId={mid} from '{name}'")
+
+                entry["arr"] = "radarr"
+                entry["arr_id"] = mid
+
                 if not dry_run:
                     try:
                         if radarr.add_tag(mid, uploading_tag):
                             tagged_radarr += 1
                     except SystemExit:
                         errors += 1
-                tracked[th] = {"name": name, "arr": "radarr", "arr_id": mid, "tag": uploading_tag, "last_seen": now}
-                new_tracked += 1
+
+                if enforce_cqp and radarr_no_upgrades_id is not None:
+                    item = radarr.get_item(mid)
+                    current_pid = int(item.get("qualityProfileId") or 0)
+
+                    if current_pid == radarr_no_upgrades_id:
+                        profiles_already_ok += 1
+                    else:
+                        if current_pid and current_pid != radarr_no_upgrades_id and not dry_run:
+                            entry["profile_before"] = current_pid
+
+                        if not dry_run and current_pid != radarr_no_upgrades_id:
+                            if radarr.set_quality_profile_id(mid, radarr_no_upgrades_id):
+                                profiles_applied += 1
+
+                        log("INFO", f"uploading sync: set CQP '{cqp_name}' for Radarr movieId={mid} (was {current_pid}).")
+
+                if not dry_run:
+                    tracked[th] = entry
+                    new_tracked += 1
+
                 matched = True
             else:
                 parse_calls += 1
@@ -1523,28 +1737,54 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
                     sid = int(ps["series"]["id"])
                     if is_sonarr_full_season(ps):
                         log("INFO", f"uploading sync: sonarr match seriesId={sid} (full season) from '{name}'")
+
+                        entry["arr"] = "sonarr"
+                        entry["arr_id"] = sid
+
                         if not dry_run:
                             try:
                                 if sonarr.add_tag(sid, uploading_tag):
                                     tagged_sonarr += 1
                             except SystemExit:
                                 errors += 1
-                        tracked[th] = {"name": name, "arr": "sonarr", "arr_id": sid, "tag": uploading_tag, "last_seen": now}
-                        new_tracked += 1
+
+                        if enforce_cqp and sonarr_no_upgrades_id is not None:
+                            item = sonarr.get_item(sid)
+                            current_pid = int(item.get("qualityProfileId") or 0)
+
+                            if current_pid == sonarr_no_upgrades_id:
+                                profiles_already_ok += 1
+                            else:
+                                if current_pid and current_pid != sonarr_no_upgrades_id and not dry_run:
+                                    entry["profile_before"] = current_pid
+
+                                if not dry_run and current_pid != sonarr_no_upgrades_id:
+                                    if sonarr.set_quality_profile_id(sid, sonarr_no_upgrades_id):
+                                        profiles_applied += 1
+
+                                log("INFO", f"uploading sync: set CQP '{cqp_name}' for Sonarr seriesId={sid} (was {current_pid}).")
+
+                        if not dry_run:
+                            tracked[th] = entry
+                            new_tracked += 1
+
                         matched = True
                     else:
                         log("DEBUG", f"uploading sync: sonarr match but not full season, skipping '{name}'")
-                        unmatched[th] = {"name": name, "reason": "sonarr:not_full_season", "last_seen": now}
+                        if not dry_run:
+                            unmatched[th] = {"name": name, "reason": "sonarr:not_full_season", "last_seen": now}
                         skipped_unmatched += 1
                         matched = True
 
         if not matched:
-            unmatched[th] = {"name": name, "reason": "no_match", "last_seen": now}
+            if not dry_run:
+                unmatched[th] = {"name": name, "reason": "no_match", "last_seen": now}
             skipped_unmatched += 1
             log("DEBUG", f"uploading sync: no Arr match for '{name}'")
 
         if th in tracked and th in unmatched:
-            unmatched.pop(th, None)
+            if not dry_run:
+                unmatched.pop(th, None)
 
     gone_hashes = [h for h in list(tracked.keys()) if h not in current_by_hash]
     for h in gone_hashes:
@@ -1558,18 +1798,46 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
         if isinstance(arr_id, str) and arr_id.isdigit():
             arr_id = int(arr_id)
 
-        if remove_when_gone and isinstance(arr_id, int) and arr_id > 0 and not dry_run:
-            try:
-                if arr_name == "radarr" and radarr is not None:
-                    if radarr.remove_tag(arr_id, uploading_tag):
-                        removed_tags += 1
-                elif arr_name == "sonarr" and sonarr is not None:
-                    if sonarr.remove_tag(arr_id, uploading_tag):
-                        removed_tags += 1
-            except SystemExit:
-                errors += 1
+        # Remove tag and restore profile (Case 2)
+        if isinstance(arr_id, int) and arr_id > 0 and not dry_run:
+            # remove tag if configured
+            if remove_when_gone:
+                try:
+                    if arr_name == "radarr" and radarr is not None:
+                        if radarr.remove_tag(arr_id, uploading_tag):
+                            removed_tags += 1
+                    elif arr_name == "sonarr" and sonarr is not None:
+                        if sonarr.remove_tag(arr_id, uploading_tag):
+                            removed_tags += 1
+                except SystemExit:
+                    errors += 1
 
-        tracked.pop(h, None)
+            # restore previous profile if configured and stored
+            if restore_cqp:
+                prev_pid = entry.get("profile_before")
+                try:
+                    prev_pid = int(prev_pid) if prev_pid is not None else None
+                except Exception:
+                    prev_pid = None
+
+                if prev_pid:
+                    try:
+                        if arr_name == "radarr" and radarr is not None:
+                            if radarr.set_quality_profile_id(arr_id, prev_pid):
+                                profiles_restored += 1
+                            log("INFO", f"uploading sync: restored previous CQP id={prev_pid} for Radarr item_id={arr_id}.")
+                        elif arr_name == "sonarr" and sonarr is not None:
+                            if sonarr.set_quality_profile_id(arr_id, prev_pid):
+                                profiles_restored += 1
+                            log("INFO", f"uploading sync: restored previous CQP id={prev_pid} for Sonarr item_id={arr_id}.")
+                    except SystemExit:
+                        errors += 1
+                else:
+                    profiles_restore_skipped += 1
+                    log("INFO", f"uploading sync: no profile_before stored for {arr_name} item_id={arr_id}; skipping restore.")
+
+        if not dry_run:
+            tracked.pop(h, None)
 
     # Purge old unmatched entries that are not currently present
     for h in list(unmatched.keys()):
@@ -1577,10 +1845,12 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
             continue
         entry = unmatched.get(h)
         if not isinstance(entry, dict):
-            unmatched.pop(h, None)
+            if not dry_run:
+                unmatched.pop(h, None)
             continue
         if not unmatched_fresh(entry):
-            unmatched.pop(h, None)
+            if not dry_run:
+                unmatched.pop(h, None)
 
     if not dry_run:
         save_uploading_state(state_file, {"tracked": tracked, "unmatched": unmatched})
@@ -1603,6 +1873,16 @@ def run_backfill_uploading(arr_target: str, dry_run: bool, limit: int) -> dict:
         "removed_tags": removed_tags,
         "gone_tracked": len(gone_hashes),
         "errors": errors,
+
+        # --- CQP output (new feature) ---
+        "cqp_name": cqp_name,
+        "cqp_enforce": enforce_cqp,
+        "cqp_restore": restore_cqp,
+        "profiles_applied": profiles_applied,
+        "profiles_fixed": profiles_fixed,
+        "profiles_already_ok": profiles_already_ok,
+        "profiles_restored": profiles_restored,
+        "profiles_restore_skipped": profiles_restore_skipped,
     }
 
 # -----------------------------

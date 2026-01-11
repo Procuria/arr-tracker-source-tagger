@@ -1,44 +1,39 @@
-# Release v0.5 — Regression & Stability Fixes
+# v0.6 – Uploading-aware Quality Profile Enforcement
 
-This release focuses entirely on **stability, regression fixes, and hardening** of existing features introduced in earlier versions.
+## Added
 
-No new functionality is introduced in v0.5.
+- **Uploading tag ↔ Quality Profile enforcement**
+  - When the `uploading` tag is applied, the service now enforces a configurable
+    Custom Quality Profile (CQP), e.g. `No Upgrades`, on the affected Sonarr/Radarr item.
+  - The previously active quality profile is stored in `uploading_state.json` and
+    automatically restored once the `uploading` tag is removed.
 
----
+- **Drift correction while uploading**
+  - If an item is already tagged as `uploading` but its quality profile was changed
+    manually or by another tool, the service re-applies the configured CQP to ensure
+    upgrades remain blocked.
 
-## 🛠 Fixed: ArrClient method regressions
+- **State-aware and safe by design**
+  - All profile switches are tracked per torrent hash.
+  - `dry_run=true` remains fully side‑effect free (no tags, no profile changes, no state writes).
 
-Several runtime errors were caused by methods not being bound correctly to `ArrClient` due to earlier refactors and indentation changes.
+## Configuration
 
-The following methods are now **guaranteed to exist at runtime** via explicit monkeypatching:
+New environment variables:
 
-- `apply_source_tag()`  
-- `fetch_history()`  
+- `UPLOADING_CQP_NAME` (default: `No Upgrades`)
+- `UPLOADING_CQP_ENFORCE` (default: `true`)
+- `UPLOADING_CQP_RESTORE` (default: `true`)
 
-This prevents runtime failures such as:
-- `AttributeError: 'ArrClient' object has no attribute 'apply_source_tag'`
-- `AttributeError: 'ArrClient' object has no attribute 'fetch_history'`
+If the configured CQP cannot be found in an Arr instance, profile switching is
+disabled for that Arr while tagging continues to function.
 
----
+## Why
 
-## 🔁 Backfill reliability improvements
-
-- `/backfill/history` is now robust against missing ArrClient methods
-- History backfill no longer aborts due to internal method resolution issues
-- Webhook-based tagging (`/tag`) and history backfill now share a consistent, hardened ArrClient surface
-
----
-
-## 🧠 Design note
-
-These fixes intentionally favor **runtime safety over structural refactors** to avoid further regressions.  
-Monkeypatching is used deliberately to ensure backward compatibility and predictable behavior across deployments.
-
-A future release may clean up duplicated or mis-indented legacy methods, but v0.5 prioritizes correctness and stability.
+This release prevents accidental upgrades, re-downloads, or replacements of media
+that is actively being uploaded to trackers, while cleanly restoring the original
+setup once the upload is finished.
 
 ---
 
-## 🏷 Version
-
-- **Tag:** v0.5
-- **Scope:** Regression fixes only
+Quietly practical. Nothing magical — just fewer surprises.
